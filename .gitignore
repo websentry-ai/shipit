@@ -7,3 +7,6 @@ ARCHITECTURE_REFERENCE.md
 # Compiled binaries (in root only)
 /shipit
 /shipit-server
+
+# Production manifests with secrets
+*-production.yaml
