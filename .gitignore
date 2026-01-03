@@ -10,3 +10,6 @@ ARCHITECTURE_REFERENCE.md
 
 # Production manifests with secrets
 *-production.yaml
+
+# Cloud operations log (contains sensitive AWS resource info)
+CLOUD_OPS_LOG.md
