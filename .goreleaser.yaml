@@ -36,18 +36,17 @@ builds:
 
 archives:
   - id: cli
-    builds:
+    ids:
       - shipit
-    format: tar.gz
+    formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        format: zip
 
   - id: server
-    builds:
+    ids:
       - shipit-server
-    format: tar.gz
+    formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
