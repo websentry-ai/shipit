@@ -9,11 +9,12 @@ import {
   deployApp,
   rollbackApp,
   deleteApp,
+  updateApp,
   setSecret,
   deleteSecret,
   streamLogs,
 } from '../api/client';
-import type { AppRevision, AppSecret } from '../types';
+import type { AppRevision, AppSecret, UpdateAppRequest } from '../types';
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -49,13 +50,20 @@ export default function AppDetail() {
   const { appId } = useParams<{ appId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<'overview' | 'secrets' | 'revisions' | 'logs'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'revisions' | 'logs'>('overview');
   const [logs, setLogs] = useState<string[]>([]);
   const [showSecretModal, setShowSecretModal] = useState(false);
   const [newSecretKey, setNewSecretKey] = useState('');
   const [newSecretValue, setNewSecretValue] = useState('');
   const logsEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+
+  // Environment variable editing state
+  const [envVars, setEnvVars] = useState<Record<string, string>>({});
+  const [newEnvKey, setNewEnvKey] = useState('');
+  const [newEnvValue, setNewEnvValue] = useState('');
+  const [editingEnvKey, setEditingEnvKey] = useState<string | null>(null);
+  const [editingEnvValue, setEditingEnvValue] = useState('');
 
   const { data: app, isLoading } = useQuery({
     queryKey: ['app', appId],
@@ -122,6 +130,20 @@ export default function AppDetail() {
     },
   });
 
+  const updateAppMutation = useMutation({
+    mutationFn: (data: UpdateAppRequest) => updateApp(appId!, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['app', appId] });
+    },
+  });
+
+  // Sync env vars with app data
+  useEffect(() => {
+    if (app?.env_vars) {
+      setEnvVars(app.env_vars);
+    }
+  }, [app?.env_vars]);
+
   // Stream logs when logs tab is active
   useEffect(() => {
     if (activeTab === 'logs' && appId) {
@@ -173,6 +195,33 @@ export default function AppDetail() {
   const handleDeleteSecret = (key: string) => {
     if (confirm(`Delete secret "${key}"? You'll need to redeploy for changes to take effect.`)) {
       deleteSecretMutation.mutate(key);
+    }
+  };
+
+  const handleAddEnvVar = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newEnvKey && newEnvValue) {
+      const updated = { ...envVars, [newEnvKey]: newEnvValue };
+      updateAppMutation.mutate({ env_vars: updated });
+      setNewEnvKey('');
+      setNewEnvValue('');
+    }
+  };
+
+  const handleUpdateEnvVar = (key: string) => {
+    if (editingEnvValue !== envVars[key]) {
+      const updated = { ...envVars, [key]: editingEnvValue };
+      updateAppMutation.mutate({ env_vars: updated });
+    }
+    setEditingEnvKey(null);
+    setEditingEnvValue('');
+  };
+
+  const handleDeleteEnvVar = (key: string) => {
+    if (confirm(`Delete environment variable "${key}"? You'll need to redeploy for changes to take effect.`)) {
+      const updated = { ...envVars };
+      delete updated[key];
+      updateAppMutation.mutate({ env_vars: updated });
     }
   };
 
@@ -270,6 +319,7 @@ export default function AppDetail() {
       <div className="border-b border-gray-200 mb-6">
         <nav className="flex -mb-px">
           <Tab active={activeTab === 'overview'} onClick={() => setActiveTab('overview')}>Overview</Tab>
+          <Tab active={activeTab === 'env'} onClick={() => setActiveTab('env')}>Environment</Tab>
           <Tab active={activeTab === 'secrets'} onClick={() => setActiveTab('secrets')}>Secrets</Tab>
           <Tab active={activeTab === 'revisions'} onClick={() => setActiveTab('revisions')}>Revisions</Tab>
           <Tab active={activeTab === 'logs'} onClick={() => setActiveTab('logs')}>Logs</Tab>
@@ -342,6 +392,133 @@ export default function AppDetail() {
               </dl>
             </div>
           )}
+        </div>
+      )}
+
+      {activeTab === 'env' && (
+        <div className="bg-white rounded-lg border border-gray-200">
+          <div className="p-4 border-b border-gray-200">
+            <h3 className="text-lg font-medium text-gray-900">Environment Variables</h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Configure environment variables for your application. Changes take effect on the next deploy.
+            </p>
+          </div>
+
+          {/* Add new env var form */}
+          <form onSubmit={handleAddEnvVar} className="p-4 bg-gray-50 border-b border-gray-200">
+            <div className="flex gap-3">
+              <input
+                type="text"
+                value={newEnvKey}
+                onChange={(e) => setNewEnvKey(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, ''))}
+                placeholder="KEY_NAME"
+                className="flex-1 px-3 py-2 border border-gray-300 rounded-md font-mono text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+              <input
+                type="text"
+                value={newEnvValue}
+                onChange={(e) => setNewEnvValue(e.target.value)}
+                placeholder="value"
+                className="flex-[2] px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+              <button
+                type="submit"
+                disabled={!newEnvKey || !newEnvValue || updateAppMutation.isPending}
+                className="px-4 py-2 bg-indigo-600 text-white text-sm rounded-md hover:bg-indigo-700 disabled:opacity-50"
+              >
+                Add
+              </button>
+            </div>
+          </form>
+
+          {Object.keys(envVars).length === 0 ? (
+            <div className="p-8 text-center text-gray-500">
+              No environment variables configured
+            </div>
+          ) : (
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase w-1/3">Key</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th>
+                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase w-24">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200">
+                {Object.entries(envVars).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => (
+                  <tr key={key}>
+                    <td className="px-6 py-4 font-mono text-sm font-medium text-gray-900">{key}</td>
+                    <td className="px-6 py-4">
+                      {editingEnvKey === key ? (
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={editingEnvValue}
+                            onChange={(e) => setEditingEnvValue(e.target.value)}
+                            className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            autoFocus
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleUpdateEnvVar(key);
+                              if (e.key === 'Escape') { setEditingEnvKey(null); setEditingEnvValue(''); }
+                            }}
+                          />
+                          <button
+                            onClick={() => handleUpdateEnvVar(key)}
+                            className="px-2 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700"
+                          >
+                            Save
+                          </button>
+                          <button
+                            onClick={() => { setEditingEnvKey(null); setEditingEnvValue(''); }}
+                            className="px-2 py-1 text-gray-600 hover:bg-gray-100 text-xs rounded"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <code className="text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded max-w-md truncate block">
+                          {value}
+                        </code>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 text-right space-x-2">
+                      {editingEnvKey !== key && (
+                        <>
+                          <button
+                            onClick={() => { setEditingEnvKey(key); setEditingEnvValue(value); }}
+                            className="text-indigo-600 hover:text-indigo-900 text-sm"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => handleDeleteEnvVar(key)}
+                            className="text-red-600 hover:text-red-900 text-sm"
+                          >
+                            Delete
+                          </button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {updateAppMutation.isPending && (
+            <div className="p-4 text-sm text-indigo-600 border-t border-gray-200 flex items-center gap-2">
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-600"></div>
+              Saving changes...
+            </div>
+          )}
+          {updateAppMutation.isError && (
+            <div className="p-4 text-sm text-red-600 border-t border-gray-200">
+              Error saving changes. Please try again.
+            </div>
+          )}
+          <p className="p-4 text-sm text-gray-500 border-t border-gray-200">
+            Redeploy the app after adding or updating environment variables for changes to take effect.
+          </p>
         </div>
       )}
 

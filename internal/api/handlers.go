@@ -301,6 +301,108 @@ func (h *Handler) GetApp(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(app)
 }
 
+func (h *Handler) UpdateApp(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	// Verify app exists
+	existing, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	var req struct {
+		Image         *string           `json:"image"`
+		Replicas      *int              `json:"replicas"`
+		EnvVars       map[string]string `json:"env_vars"`
+		CPURequest    *string           `json:"cpu_request"`
+		CPULimit      *string           `json:"cpu_limit"`
+		MemoryRequest *string           `json:"memory_request"`
+		MemoryLimit   *string           `json:"memory_limit"`
+		HealthPath    *string           `json:"health_path"`
+		HealthPort    *int              `json:"health_port"`
+		HealthDelay   *int              `json:"health_initial_delay"`
+		HealthPeriod  *int              `json:"health_period"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Build update params, using existing values as defaults
+	image := existing.Image
+	if req.Image != nil {
+		image = *req.Image
+	}
+	replicas := existing.Replicas
+	if req.Replicas != nil {
+		replicas = *req.Replicas
+	}
+	cpuRequest := existing.CPURequest
+	if req.CPURequest != nil {
+		cpuRequest = *req.CPURequest
+	}
+	cpuLimit := existing.CPULimit
+	if req.CPULimit != nil {
+		cpuLimit = *req.CPULimit
+	}
+	memRequest := existing.MemoryRequest
+	if req.MemoryRequest != nil {
+		memRequest = *req.MemoryRequest
+	}
+	memLimit := existing.MemoryLimit
+	if req.MemoryLimit != nil {
+		memLimit = *req.MemoryLimit
+	}
+
+	// Handle env vars - merge with existing if partial update
+	var envVarsJSON []byte
+	if req.EnvVars != nil {
+		envVarsJSON, _ = json.Marshal(req.EnvVars)
+	} else {
+		envVarsJSON = existing.EnvVars
+	}
+
+	// Health check settings
+	healthPath := existing.HealthPath
+	if req.HealthPath != nil {
+		healthPath = req.HealthPath
+	}
+	healthPort := existing.HealthPort
+	if req.HealthPort != nil {
+		healthPort = req.HealthPort
+	}
+	healthDelay := existing.HealthInitialDelay
+	if req.HealthDelay != nil {
+		healthDelay = req.HealthDelay
+	}
+	healthPeriod := existing.HealthPeriod
+	if req.HealthPeriod != nil {
+		healthPeriod = req.HealthPeriod
+	}
+
+	app, err := h.db.UpdateApp(r.Context(), db.UpdateAppParams{
+		ID:          appID,
+		Image:       image,
+		Replicas:    replicas,
+		EnvVars:     envVarsJSON,
+		CPURequest:  cpuRequest,
+		CPULimit:    cpuLimit,
+		MemRequest:  memRequest,
+		MemLimit:    memLimit,
+		HealthPath:  healthPath,
+		HealthPort:  healthPort,
+		HealthDelay: healthDelay,
+		HealthPeriod: healthPeriod,
+	})
+	if err != nil {
+		httpError(w, "failed to update app", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(app)
+}
+
 func (h *Handler) DeployApp(w http.ResponseWriter, r *http.Request) {
 	appID := chi.URLParam(r, "appID")
 

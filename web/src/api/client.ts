@@ -6,6 +6,7 @@ import type {
   AppSecret,
   AppStatus,
   CreateAppRequest,
+  UpdateAppRequest,
 } from '../types';
 
 const API_BASE = '/api';
@@ -111,6 +112,16 @@ export async function createApp(
 
 export async function deleteApp(id: string): Promise<void> {
   return request(`/apps/${id}`, { method: 'DELETE' });
+}
+
+export async function updateApp(
+  id: string,
+  data: UpdateAppRequest
+): Promise<App> {
+  return request<App>(`/apps/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
 }
 
 export async function deployApp(id: string): Promise<App> {

@@ -99,3 +99,17 @@ export interface CreateAppRequest {
   health_initial_delay?: number;
   health_period?: number;
 }
+
+export interface UpdateAppRequest {
+  image?: string;
+  replicas?: number;
+  env_vars?: Record<string, string>;
+  cpu_request?: string;
+  cpu_limit?: string;
+  memory_request?: string;
+  memory_limit?: string;
+  health_path?: string;
+  health_port?: number;
+  health_initial_delay?: number;
+  health_period?: number;
+}

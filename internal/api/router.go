@@ -60,6 +60,8 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 		// Apps (direct access)
 		r.Route("/api/apps/{appID}", func(r chi.Router) {
 			r.Get("/", h.GetApp)
+			r.Put("/", h.UpdateApp)
+			r.Patch("/", h.UpdateApp)
 			r.Delete("/", h.DeleteApp)
 			r.Post("/deploy", h.DeployApp)
 			r.Get("/logs", h.StreamLogs)
