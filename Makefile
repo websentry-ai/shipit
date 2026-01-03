@@ -1,4 +1,4 @@
-.PHONY: setup dev build test clean
+.PHONY: setup dev build test clean snapshot release docker
 
 # Development
 setup:
@@ -36,5 +36,16 @@ test:
 
 # Clean
 clean:
-	rm -rf bin/
+	rm -rf bin/ dist/
 	docker compose down -v
+
+# Release (requires goreleaser and GITHUB_TOKEN)
+snapshot:
+	goreleaser release --snapshot --clean
+
+release:
+	goreleaser release --clean
+
+# Docker
+docker:
+	docker build -t shipit:latest .
