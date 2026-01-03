@@ -2,28 +2,30 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/vigneshsubbiah/shipit/internal/auth"
 	"github.com/vigneshsubbiah/shipit/internal/db"
+	"github.com/vigneshsubbiah/shipit/internal/web"
 )
 
 func NewRouter(database *db.DB, encryptKey string) http.Handler {
 	r := chi.NewRouter()
 	h := NewHandler(database, encryptKey)
 
-	// Middleware
+	// Global middleware
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
-	r.Use(jsonContentType)
 
 	// Public routes
 	r.Get("/health", h.Health)
 
-	// Protected routes
+	// API routes with JSON content type
 	r.Group(func(r chi.Router) {
+		r.Use(jsonContentType)
 		r.Use(auth.Middleware(database))
 
 		// Projects
@@ -79,12 +81,18 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 		})
 	})
 
+	// Serve the web dashboard for non-API routes
+	r.NotFound(web.Handler().ServeHTTP)
+
 	return r
 }
 
 func jsonContentType(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+		// Only set JSON content type for API routes
+		if strings.HasPrefix(r.URL.Path, "/api") {
+			w.Header().Set("Content-Type", "application/json")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

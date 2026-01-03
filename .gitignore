@@ -13,3 +13,11 @@ ARCHITECTURE_REFERENCE.md
 
 # Cloud operations log (contains sensitive AWS resource info)
 CLOUD_OPS_LOG.md
+
+# Web dashboard
+web/node_modules/
+web/dist/
+internal/web/dist/
+
+# Build artifacts
+dist/
