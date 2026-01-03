@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { isAuthenticated } from './api/client';
 import Layout from './components/Layout';
 import Login from './pages/Login';
+import Dashboard from './pages/Dashboard';
 import Projects from './pages/Projects';
 import Clusters from './pages/Clusters';
 import Apps from './pages/Apps';
@@ -38,7 +39,8 @@ function App() {
               </ProtectedRoute>
             }
           >
-            <Route index element={<Projects />} />
+            <Route index element={<Dashboard />} />
+            <Route path="projects" element={<Projects />} />
             <Route path="projects/:projectId" element={<Clusters />} />
             <Route path="clusters/:clusterId" element={<Apps />} />
             <Route path="apps/:appId" element={<AppDetail />} />

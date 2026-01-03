@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { listProjects, createProject, deleteProject } from '../api/client';
 import type { Project } from '../types';
@@ -8,25 +8,53 @@ export default function Projects() {
   const [showCreate, setShowCreate] = useState(false);
   const [newName, setNewName] = useState('');
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  // Check if we should show the manage view (from dropdown "Manage Projects...")
+  const showManage = searchParams.get('manage') === 'true';
 
   const { data: projects, isLoading, error } = useQuery({
     queryKey: ['projects'],
     queryFn: listProjects,
   });
 
+  // Auto-redirect to default project if not in manage mode
+  useEffect(() => {
+    if (showManage || isLoading || !projects || projects.length === 0) return;
+
+    // Check for saved project in localStorage
+    const savedProjectId = localStorage.getItem('shipit_project');
+    const savedProject = savedProjectId ? projects.find(p => p.id === savedProjectId) : null;
+
+    // Redirect to saved project or first project
+    const targetProject = savedProject || projects[0];
+    if (targetProject) {
+      localStorage.setItem('shipit_project', targetProject.id);
+      navigate(`/projects/${targetProject.id}`, { replace: true });
+    }
+  }, [projects, isLoading, navigate, showManage]);
+
   const createMutation = useMutation({
     mutationFn: (name: string) => createProject(name),
-    onSuccess: () => {
+    onSuccess: (newProject) => {
       queryClient.invalidateQueries({ queryKey: ['projects'] });
       setShowCreate(false);
       setNewName('');
+      // Navigate to the new project
+      localStorage.setItem('shipit_project', newProject.id);
+      navigate(`/projects/${newProject.id}`);
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteProject(id),
-    onSuccess: () => {
+    onSuccess: (_, deletedId) => {
       queryClient.invalidateQueries({ queryKey: ['projects'] });
+      // If we deleted the saved project, clear it
+      if (localStorage.getItem('shipit_project') === deletedId) {
+        localStorage.removeItem('shipit_project');
+      }
     },
   });
 
@@ -55,6 +83,15 @@ export default function Projects() {
     return (
       <div className="bg-red-50 border border-red-200 rounded-lg p-4">
         <p className="text-red-700">Error loading projects: {(error as Error).message}</p>
+      </div>
+    );
+  }
+
+  // Show loading while redirecting (if not in manage mode and has projects)
+  if (!showManage && projects && projects.length > 0) {
+    return (
+      <div className="flex justify-center py-12">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
       </div>
     );
   }
