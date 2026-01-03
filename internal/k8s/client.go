@@ -9,6 +9,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -25,12 +26,25 @@ type ClusterInfo struct {
 }
 
 type DeployRequest struct {
-	Name      string
-	Namespace string
-	Image     string
-	Replicas  int32
-	Port      *int
-	EnvVars   map[string]string
+	Name       string
+	Namespace  string
+	Image      string
+	Replicas   int32
+	Port       *int
+	EnvVars    map[string]string
+	SecretName string // Optional: K8s Secret name to inject as env vars
+
+	// Resource limits
+	CPURequest    string
+	CPULimit      string
+	MemoryRequest string
+	MemoryLimit   string
+
+	// Health check configuration
+	HealthPath         *string
+	HealthPort         *int
+	HealthInitialDelay *int // seconds
+	HealthPeriod       *int // seconds
 }
 
 type DeploymentStatus struct {
@@ -104,8 +118,74 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		Env:   envVars,
 	}
 
+	// Inject secrets from K8s Secret if specified
+	if req.SecretName != "" {
+		container.EnvFrom = []corev1.EnvFromSource{{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: req.SecretName,
+				},
+			},
+		}}
+	}
+
 	if req.Port != nil {
 		container.Ports = []corev1.ContainerPort{{ContainerPort: int32(*req.Port)}}
+	}
+
+	// Set resource requests and limits
+	if req.CPURequest != "" || req.CPULimit != "" || req.MemoryRequest != "" || req.MemoryLimit != "" {
+		container.Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{},
+			Limits:   corev1.ResourceList{},
+		}
+		if req.CPURequest != "" {
+			container.Resources.Requests[corev1.ResourceCPU] = resource.MustParse(req.CPURequest)
+		}
+		if req.CPULimit != "" {
+			container.Resources.Limits[corev1.ResourceCPU] = resource.MustParse(req.CPULimit)
+		}
+		if req.MemoryRequest != "" {
+			container.Resources.Requests[corev1.ResourceMemory] = resource.MustParse(req.MemoryRequest)
+		}
+		if req.MemoryLimit != "" {
+			container.Resources.Limits[corev1.ResourceMemory] = resource.MustParse(req.MemoryLimit)
+		}
+	}
+
+	// Configure health probes if health path is specified
+	if req.HealthPath != nil && *req.HealthPath != "" {
+		healthPort := req.Port
+		if req.HealthPort != nil {
+			healthPort = req.HealthPort
+		}
+
+		initialDelay := int32(10)
+		if req.HealthInitialDelay != nil {
+			initialDelay = int32(*req.HealthInitialDelay)
+		}
+
+		period := int32(30)
+		if req.HealthPeriod != nil {
+			period = int32(*req.HealthPeriod)
+		}
+
+		if healthPort != nil {
+			probe := &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Path: *req.HealthPath,
+						Port: intstr.FromInt(*healthPort),
+					},
+				},
+				InitialDelaySeconds: initialDelay,
+				PeriodSeconds:       period,
+			}
+
+			// Use same config for both liveness and readiness probes
+			container.LivenessProbe = probe
+			container.ReadinessProbe = probe.DeepCopy()
+		}
 	}
 
 	// Create or update deployment
@@ -238,7 +318,50 @@ func (c *Client) DeleteApp(name, namespace string) error {
 	// Delete service
 	c.clientset.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 
+	// Delete secret (if exists)
+	c.clientset.CoreV1().Secrets(namespace).Delete(ctx, name+"-secrets", metav1.DeleteOptions{})
+
 	return nil
+}
+
+// CreateOrUpdateSecret creates or updates a K8s Secret with the given key-value pairs
+func (c *Client) CreateOrUpdateSecret(name, namespace string, data map[string]string) error {
+	ctx := context.Background()
+
+	// Ensure namespace exists
+	if err := c.ensureNamespace(ctx, namespace); err != nil {
+		return fmt.Errorf("failed to ensure namespace: %w", err)
+	}
+
+	secretsClient := c.clientset.CoreV1().Secrets(namespace)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{"managed-by": "shipit"},
+		},
+		Type:       corev1.SecretTypeOpaque,
+		StringData: data,
+	}
+
+	existing, err := secretsClient.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		// Create new secret
+		_, err = secretsClient.Create(ctx, secret, metav1.CreateOptions{})
+		return err
+	}
+
+	// Update existing secret
+	secret.ResourceVersion = existing.ResourceVersion
+	_, err = secretsClient.Update(ctx, secret, metav1.UpdateOptions{})
+	return err
+}
+
+// DeleteSecret deletes a K8s Secret
+func (c *Client) DeleteSecret(name, namespace string) error {
+	return c.clientset.CoreV1().Secrets(namespace).Delete(
+		context.Background(), name, metav1.DeleteOptions{})
 }
 
 func (c *Client) GetDeploymentStatus(name, namespace string) (*DeploymentStatus, error) {

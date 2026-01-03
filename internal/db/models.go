@@ -43,4 +43,49 @@ type App struct {
 	StatusMessage *string         `db:"status_message" json:"status_message,omitempty"`
 	CreatedAt     time.Time       `db:"created_at" json:"created_at"`
 	UpdatedAt     time.Time       `db:"updated_at" json:"updated_at"`
+
+	// Resource limits
+	CPURequest    string `db:"cpu_request" json:"cpu_request"`
+	CPULimit      string `db:"cpu_limit" json:"cpu_limit"`
+	MemoryRequest string `db:"memory_request" json:"memory_request"`
+	MemoryLimit   string `db:"memory_limit" json:"memory_limit"`
+
+	// Health check configuration
+	HealthPath         *string `db:"health_path" json:"health_path,omitempty"`
+	HealthPort         *int    `db:"health_port" json:"health_port,omitempty"`
+	HealthInitialDelay *int    `db:"health_initial_delay" json:"health_initial_delay,omitempty"`
+	HealthPeriod       *int    `db:"health_period" json:"health_period,omitempty"`
+
+	// Revision tracking
+	CurrentRevision int `db:"current_revision" json:"current_revision"`
+}
+
+// AppRevision stores a snapshot of app configuration at deploy time
+type AppRevision struct {
+	ID             string          `db:"id" json:"id"`
+	AppID          string          `db:"app_id" json:"app_id"`
+	RevisionNumber int             `db:"revision_number" json:"revision_number"`
+	Image          string          `db:"image" json:"image"`
+	Replicas       int             `db:"replicas" json:"replicas"`
+	Port           *int            `db:"port" json:"port,omitempty"`
+	EnvVars        json.RawMessage `db:"env_vars" json:"env_vars"`
+	CPURequest     *string         `db:"cpu_request" json:"cpu_request,omitempty"`
+	CPULimit       *string         `db:"cpu_limit" json:"cpu_limit,omitempty"`
+	MemoryRequest  *string         `db:"memory_request" json:"memory_request,omitempty"`
+	MemoryLimit    *string         `db:"memory_limit" json:"memory_limit,omitempty"`
+	HealthPath     *string         `db:"health_path" json:"health_path,omitempty"`
+	HealthPort     *int            `db:"health_port" json:"health_port,omitempty"`
+	HealthDelay    *int            `db:"health_initial_delay" json:"health_initial_delay,omitempty"`
+	HealthPeriod   *int            `db:"health_period" json:"health_period,omitempty"`
+	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
+	DeployedBy     *string         `db:"deployed_by" json:"deployed_by,omitempty"`
+}
+
+type AppSecret struct {
+	ID             string    `db:"id" json:"id"`
+	AppID          string    `db:"app_id" json:"app_id"`
+	Key            string    `db:"key" json:"key"`
+	ValueEncrypted []byte    `db:"value_encrypted" json:"-"`
+	CreatedAt      time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`
 }

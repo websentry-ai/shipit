@@ -62,6 +62,20 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 			r.Post("/deploy", h.DeployApp)
 			r.Get("/logs", h.StreamLogs)
 			r.Get("/status", h.GetAppStatus)
+			r.Post("/rollback", h.RollbackApp)
+
+			// Secrets under app
+			r.Route("/secrets", func(r chi.Router) {
+				r.Get("/", h.ListSecrets)
+				r.Post("/", h.SetSecret)
+				r.Delete("/{key}", h.DeleteSecret)
+			})
+
+			// Revisions under app
+			r.Route("/revisions", func(r chi.Router) {
+				r.Get("/", h.ListRevisions)
+				r.Get("/{revision}", h.GetRevision)
+			})
 		})
 	})
 

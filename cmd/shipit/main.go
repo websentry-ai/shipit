@@ -38,6 +38,7 @@ func main() {
 	rootCmd.AddCommand(appsCmd())
 	rootCmd.AddCommand(deployCmd())
 	rootCmd.AddCommand(logsCmd())
+	rootCmd.AddCommand(secretsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -248,6 +249,16 @@ func appsCmd() *cobra.Command {
 			port, _ := cmd.Flags().GetInt("port")
 			namespace, _ := cmd.Flags().GetString("namespace")
 			envFlags, _ := cmd.Flags().GetStringSlice("env")
+			// Resource limits
+			cpuRequest, _ := cmd.Flags().GetString("cpu-request")
+			cpuLimit, _ := cmd.Flags().GetString("cpu-limit")
+			memRequest, _ := cmd.Flags().GetString("memory-request")
+			memLimit, _ := cmd.Flags().GetString("memory-limit")
+			// Health check
+			healthPath, _ := cmd.Flags().GetString("health-path")
+			healthPort, _ := cmd.Flags().GetInt("health-port")
+			healthDelay, _ := cmd.Flags().GetInt("health-initial-delay")
+			healthPeriod, _ := cmd.Flags().GetInt("health-period")
 
 			if name == "" || image == "" {
 				fatal(fmt.Errorf("--name and --image are required"))
@@ -271,6 +282,32 @@ func appsCmd() *cobra.Command {
 			if port > 0 {
 				body["port"] = port
 			}
+			// Resource limits (use defaults if not specified)
+			if cpuRequest != "" {
+				body["cpu_request"] = cpuRequest
+			}
+			if cpuLimit != "" {
+				body["cpu_limit"] = cpuLimit
+			}
+			if memRequest != "" {
+				body["memory_request"] = memRequest
+			}
+			if memLimit != "" {
+				body["memory_limit"] = memLimit
+			}
+			// Health check
+			if healthPath != "" {
+				body["health_path"] = healthPath
+				if healthPort > 0 {
+					body["health_port"] = healthPort
+				}
+				if healthDelay > 0 {
+					body["health_initial_delay"] = healthDelay
+				}
+				if healthPeriod > 0 {
+					body["health_period"] = healthPeriod
+				}
+			}
 
 			resp, err := apiRequest("POST", "/api/clusters/"+args[0]+"/apps", body)
 			if err != nil {
@@ -285,6 +322,16 @@ func appsCmd() *cobra.Command {
 	createCmd.Flags().Int("port", 0, "Container port")
 	createCmd.Flags().String("namespace", "default", "Kubernetes namespace")
 	createCmd.Flags().StringSlice("env", nil, "Environment variables (KEY=VALUE)")
+	// Resource limits
+	createCmd.Flags().String("cpu-request", "", "CPU request (e.g., 100m) - default: 100m")
+	createCmd.Flags().String("cpu-limit", "", "CPU limit (e.g., 500m) - default: 500m")
+	createCmd.Flags().String("memory-request", "", "Memory request (e.g., 128Mi) - default: 128Mi")
+	createCmd.Flags().String("memory-limit", "", "Memory limit (e.g., 256Mi) - default: 256Mi")
+	// Health check
+	createCmd.Flags().String("health-path", "", "Health check HTTP path (e.g., /health)")
+	createCmd.Flags().Int("health-port", 0, "Health check port (defaults to app port)")
+	createCmd.Flags().Int("health-initial-delay", 10, "Initial delay before first health check (seconds)")
+	createCmd.Flags().Int("health-period", 30, "Period between health checks (seconds)")
 	cmd.AddCommand(createCmd)
 
 	cmd.AddCommand(&cobra.Command{
@@ -339,6 +386,57 @@ func appsCmd() *cobra.Command {
 		},
 	})
 
+	// Revisions subcommand
+	revisionsCmd := &cobra.Command{
+		Use:   "revisions <app-id>",
+		Short: "List deployment revisions for an app",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			limit, _ := cmd.Flags().GetInt("limit")
+			url := "/api/apps/" + args[0] + "/revisions"
+			if limit > 0 {
+				url += fmt.Sprintf("?limit=%d", limit)
+			}
+			resp, err := apiRequest("GET", url, nil)
+			if err != nil {
+				fatal(err)
+			}
+			printJSON(resp)
+		},
+	}
+	revisionsCmd.Flags().Int("limit", 10, "Number of revisions to show")
+	cmd.AddCommand(revisionsCmd)
+
+	// Rollback subcommand
+	rollbackCmd := &cobra.Command{
+		Use:   "rollback <app-id>",
+		Short: "Rollback app to a previous revision",
+		Long:  "Rollback an app to the previous revision, or to a specific revision with --revision",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			revision, _ := cmd.Flags().GetInt("revision")
+
+			var body map[string]interface{}
+			if revision > 0 {
+				body = map[string]interface{}{"revision": revision}
+			}
+
+			resp, err := apiRequest("POST", "/api/apps/"+args[0]+"/rollback", body)
+			if err != nil {
+				fatal(err)
+			}
+
+			var result map[string]interface{}
+			json.Unmarshal(resp, &result)
+
+			fmt.Printf("Rolling back to revision %v (image: %v)\n",
+				result["target_revision"], result["target_image"])
+			fmt.Println("Use 'shipit apps status " + args[0] + "' to check status")
+		},
+	}
+	rollbackCmd.Flags().Int("revision", 0, "Specific revision number to rollback to (default: previous)")
+	cmd.AddCommand(rollbackCmd)
+
 	return cmd
 }
 
@@ -350,7 +448,7 @@ func deployCmd() *cobra.Command {
 		Short: "Deploy an application",
 	}
 
-	createCmd := &cobra.Command{
+	deployCreateCmd := &cobra.Command{
 		Use:   "create <cluster-id>",
 		Short: "Create and deploy a new app",
 		Args:  cobra.ExactArgs(1),
@@ -361,6 +459,16 @@ func deployCmd() *cobra.Command {
 			port, _ := cmd.Flags().GetInt("port")
 			namespace, _ := cmd.Flags().GetString("namespace")
 			envFlags, _ := cmd.Flags().GetStringSlice("env")
+			// Resource limits
+			cpuRequest, _ := cmd.Flags().GetString("cpu-request")
+			cpuLimit, _ := cmd.Flags().GetString("cpu-limit")
+			memRequest, _ := cmd.Flags().GetString("memory-request")
+			memLimit, _ := cmd.Flags().GetString("memory-limit")
+			// Health check
+			healthPath, _ := cmd.Flags().GetString("health-path")
+			healthPort, _ := cmd.Flags().GetInt("health-port")
+			healthDelay, _ := cmd.Flags().GetInt("health-initial-delay")
+			healthPeriod, _ := cmd.Flags().GetInt("health-period")
 
 			if name == "" || image == "" {
 				fatal(fmt.Errorf("--name and --image are required"))
@@ -384,6 +492,32 @@ func deployCmd() *cobra.Command {
 			if port > 0 {
 				body["port"] = port
 			}
+			// Resource limits (use defaults if not specified)
+			if cpuRequest != "" {
+				body["cpu_request"] = cpuRequest
+			}
+			if cpuLimit != "" {
+				body["cpu_limit"] = cpuLimit
+			}
+			if memRequest != "" {
+				body["memory_request"] = memRequest
+			}
+			if memLimit != "" {
+				body["memory_limit"] = memLimit
+			}
+			// Health check
+			if healthPath != "" {
+				body["health_path"] = healthPath
+				if healthPort > 0 {
+					body["health_port"] = healthPort
+				}
+				if healthDelay > 0 {
+					body["health_initial_delay"] = healthDelay
+				}
+				if healthPeriod > 0 {
+					body["health_period"] = healthPeriod
+				}
+			}
 
 			// Create app
 			resp, err := apiRequest("POST", "/api/clusters/"+args[0]+"/apps", body)
@@ -406,13 +540,23 @@ func deployCmd() *cobra.Command {
 			fmt.Println("Deployment started. Use 'shipit apps status " + appID + "' to check status")
 		},
 	}
-	createCmd.Flags().String("name", "", "App name")
-	createCmd.Flags().String("image", "", "Container image")
-	createCmd.Flags().Int("replicas", 1, "Number of replicas")
-	createCmd.Flags().Int("port", 0, "Container port")
-	createCmd.Flags().String("namespace", "default", "Kubernetes namespace")
-	createCmd.Flags().StringSlice("env", nil, "Environment variables (KEY=VALUE)")
-	cmd.AddCommand(createCmd)
+	deployCreateCmd.Flags().String("name", "", "App name")
+	deployCreateCmd.Flags().String("image", "", "Container image")
+	deployCreateCmd.Flags().Int("replicas", 1, "Number of replicas")
+	deployCreateCmd.Flags().Int("port", 0, "Container port")
+	deployCreateCmd.Flags().String("namespace", "default", "Kubernetes namespace")
+	deployCreateCmd.Flags().StringSlice("env", nil, "Environment variables (KEY=VALUE)")
+	// Resource limits
+	deployCreateCmd.Flags().String("cpu-request", "", "CPU request (e.g., 100m) - default: 100m")
+	deployCreateCmd.Flags().String("cpu-limit", "", "CPU limit (e.g., 500m) - default: 500m")
+	deployCreateCmd.Flags().String("memory-request", "", "Memory request (e.g., 128Mi) - default: 128Mi")
+	deployCreateCmd.Flags().String("memory-limit", "", "Memory limit (e.g., 256Mi) - default: 256Mi")
+	// Health check
+	deployCreateCmd.Flags().String("health-path", "", "Health check HTTP path (e.g., /health)")
+	deployCreateCmd.Flags().Int("health-port", 0, "Health check port (defaults to app port)")
+	deployCreateCmd.Flags().Int("health-initial-delay", 10, "Initial delay before first health check (seconds)")
+	deployCreateCmd.Flags().Int("health-period", 30, "Period between health checks (seconds)")
+	cmd.AddCommand(deployCreateCmd)
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "trigger <app-id>",
@@ -476,6 +620,80 @@ func logsCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolP("follow", "f", false, "Follow log output")
 	cmd.Flags().String("tail", "", "Number of lines to show from the end")
+
+	return cmd
+}
+
+// Secrets
+
+func secretsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "secrets",
+		Aliases: []string{"secret", "s"},
+		Short:   "Manage application secrets",
+	}
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list <app-id>",
+		Short: "List secrets for an app (keys only, values are never shown)",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			resp, err := apiRequest("GET", "/api/apps/"+args[0]+"/secrets", nil)
+			if err != nil {
+				fatal(err)
+			}
+			printJSON(resp)
+		},
+	})
+
+	setCmd := &cobra.Command{
+		Use:   "set <app-id>",
+		Short: "Set a secret for an app",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			key, _ := cmd.Flags().GetString("key")
+			value, _ := cmd.Flags().GetString("value")
+
+			if key == "" || value == "" {
+				fatal(fmt.Errorf("--key and --value are required"))
+			}
+
+			body := map[string]string{
+				"key":   key,
+				"value": value,
+			}
+			resp, err := apiRequest("POST", "/api/apps/"+args[0]+"/secrets", body)
+			if err != nil {
+				fatal(err)
+			}
+			printJSON(resp)
+			fmt.Println("\nSecret set. Redeploy the app to apply: shipit apps deploy " + args[0])
+		},
+	}
+	setCmd.Flags().String("key", "", "Secret key (required)")
+	setCmd.Flags().String("value", "", "Secret value (required)")
+	cmd.AddCommand(setCmd)
+
+	deleteCmd := &cobra.Command{
+		Use:   "delete <app-id>",
+		Short: "Delete a secret from an app",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			key, _ := cmd.Flags().GetString("key")
+
+			if key == "" {
+				fatal(fmt.Errorf("--key is required"))
+			}
+
+			_, err := apiRequest("DELETE", "/api/apps/"+args[0]+"/secrets/"+key, nil)
+			if err != nil {
+				fatal(err)
+			}
+			fmt.Println("Secret deleted. Redeploy the app to apply: shipit apps deploy " + args[0])
+		},
+	}
+	deleteCmd.Flags().String("key", "", "Secret key to delete (required)")
+	cmd.AddCommand(deleteCmd)
 
 	return cmd
 }

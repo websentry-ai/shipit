@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/vigneshsubbiah/shipit/internal/auth"
@@ -223,6 +224,16 @@ func (h *Handler) CreateApp(w http.ResponseWriter, r *http.Request) {
 		Replicas  int               `json:"replicas"`
 		Port      *int              `json:"port"`
 		EnvVars   map[string]string `json:"env_vars"`
+		// Resource limits
+		CPURequest    string `json:"cpu_request"`
+		CPULimit      string `json:"cpu_limit"`
+		MemoryRequest string `json:"memory_request"`
+		MemoryLimit   string `json:"memory_limit"`
+		// Health check
+		HealthPath         *string `json:"health_path"`
+		HealthPort         *int    `json:"health_port"`
+		HealthInitialDelay *int    `json:"health_initial_delay"`
+		HealthPeriod       *int    `json:"health_period"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, "invalid request body", http.StatusBadRequest)
@@ -238,10 +249,39 @@ func (h *Handler) CreateApp(w http.ResponseWriter, r *http.Request) {
 	if req.Replicas <= 0 {
 		req.Replicas = 1
 	}
+	// Apply default resource limits
+	if req.CPURequest == "" {
+		req.CPURequest = "100m"
+	}
+	if req.CPULimit == "" {
+		req.CPULimit = "500m"
+	}
+	if req.MemoryRequest == "" {
+		req.MemoryRequest = "128Mi"
+	}
+	if req.MemoryLimit == "" {
+		req.MemoryLimit = "256Mi"
+	}
 
 	envVarsJSON, _ := json.Marshal(req.EnvVars)
 
-	app, err := h.db.CreateApp(r.Context(), clusterID, req.Name, req.Namespace, req.Image, req.Replicas, req.Port, envVarsJSON)
+	app, err := h.db.CreateApp(r.Context(), db.CreateAppParams{
+		ClusterID:    clusterID,
+		Name:         req.Name,
+		Namespace:    req.Namespace,
+		Image:        req.Image,
+		Replicas:     req.Replicas,
+		Port:         req.Port,
+		EnvVars:      envVarsJSON,
+		CPURequest:   req.CPURequest,
+		CPULimit:     req.CPULimit,
+		MemRequest:   req.MemoryRequest,
+		MemLimit:     req.MemoryLimit,
+		HealthPath:   req.HealthPath,
+		HealthPort:   req.HealthPort,
+		HealthDelay:  req.HealthInitialDelay,
+		HealthPeriod: req.HealthPeriod,
+	})
 	if err != nil {
 		httpError(w, "failed to create app", http.StatusInternalServerError)
 		return
@@ -301,16 +341,80 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		return
 	}
 
+	// Create a revision snapshot before deploying
+	newRevision := app.CurrentRevision + 1
+	cpuReq := app.CPURequest
+	cpuLim := app.CPULimit
+	memReq := app.MemoryRequest
+	memLim := app.MemoryLimit
+	_, err = h.db.CreateRevision(ctx, db.CreateRevisionParams{
+		AppID:          appID,
+		RevisionNumber: newRevision,
+		Image:          app.Image,
+		Replicas:       app.Replicas,
+		Port:           app.Port,
+		EnvVars:        app.EnvVars,
+		CPURequest:     &cpuReq,
+		CPULimit:       &cpuLim,
+		MemRequest:     &memReq,
+		MemLimit:       &memLim,
+		HealthPath:     app.HealthPath,
+		HealthPort:     app.HealthPort,
+		HealthDelay:    app.HealthInitialDelay,
+		HealthPeriod:   app.HealthPeriod,
+	})
+	if err != nil {
+		msg := "failed to create revision: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		return
+	}
+
 	var envVars map[string]string
 	json.Unmarshal(app.EnvVars, &envVars)
 
+	// Sync secrets to K8s
+	secretName := ""
+	secrets, err := h.db.GetSecretsByAppID(ctx, appID)
+	if err == nil && len(secrets) > 0 {
+		secretData := make(map[string]string)
+		for _, s := range secrets {
+			// Decrypt secret value
+			decrypted, err := auth.Decrypt(s.ValueEncrypted, h.encryptKey)
+			if err != nil {
+				msg := "failed to decrypt secret: " + err.Error()
+				h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+				return
+			}
+			secretData[s.Key] = string(decrypted)
+		}
+
+		// Create/update K8s Secret
+		secretName = app.Name + "-secrets"
+		if err := client.CreateOrUpdateSecret(secretName, app.Namespace, secretData); err != nil {
+			msg := "failed to create k8s secret: " + err.Error()
+			h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+			return
+		}
+	}
+
 	err = client.DeployApp(k8s.DeployRequest{
-		Name:      app.Name,
-		Namespace: app.Namespace,
-		Image:     app.Image,
-		Replicas:  int32(app.Replicas),
-		Port:      app.Port,
-		EnvVars:   envVars,
+		Name:       app.Name,
+		Namespace:  app.Namespace,
+		Image:      app.Image,
+		Replicas:   int32(app.Replicas),
+		Port:       app.Port,
+		EnvVars:    envVars,
+		SecretName: secretName,
+		// Resource limits
+		CPURequest:    app.CPURequest,
+		CPULimit:      app.CPULimit,
+		MemoryRequest: app.MemoryRequest,
+		MemoryLimit:   app.MemoryLimit,
+		// Health check
+		HealthPath:         app.HealthPath,
+		HealthPort:         app.HealthPort,
+		HealthInitialDelay: app.HealthInitialDelay,
+		HealthPeriod:       app.HealthPeriod,
 	})
 	if err != nil {
 		msg := err.Error()
@@ -318,7 +422,12 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		return
 	}
 
+	// Update app's current revision and status
+	h.db.UpdateAppRevision(ctx, appID, newRevision)
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
+
+	// Clean up old revisions (keep last 10)
+	h.db.DeleteOldRevisions(ctx, appID, 10)
 }
 
 func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +458,228 @@ func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Secrets
+
+func (h *Handler) ListSecrets(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	// Verify app exists
+	if _, err := h.db.GetApp(r.Context(), appID); err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	secrets, err := h.db.ListSecrets(r.Context(), appID)
+	if err != nil {
+		httpError(w, "failed to list secrets", http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(secrets)
+}
+
+func (h *Handler) SetSecret(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	// Verify app exists
+	if _, err := h.db.GetApp(r.Context(), appID); err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	var req struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Key == "" || req.Value == "" {
+		httpError(w, "key and value are required", http.StatusBadRequest)
+		return
+	}
+
+	// Encrypt the value
+	encrypted, err := auth.Encrypt([]byte(req.Value), h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to encrypt secret", http.StatusInternalServerError)
+		return
+	}
+
+	secret, err := h.db.SetSecret(r.Context(), appID, req.Key, encrypted)
+	if err != nil {
+		httpError(w, "failed to set secret", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(secret)
+}
+
+func (h *Handler) DeleteSecret(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+	key := chi.URLParam(r, "key")
+
+	// Verify app exists
+	if _, err := h.db.GetApp(r.Context(), appID); err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	if err := h.db.DeleteSecret(r.Context(), appID, key); err != nil {
+		httpError(w, "failed to delete secret", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Revisions
+
+func (h *Handler) ListRevisions(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	// Verify app exists
+	if _, err := h.db.GetApp(r.Context(), appID); err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	// Get limit from query params, default 10
+	limit := 10
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	revisions, err := h.db.ListRevisions(r.Context(), appID, limit)
+	if err != nil {
+		httpError(w, "failed to list revisions", http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(revisions)
+}
+
+func (h *Handler) GetRevision(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+	revStr := chi.URLParam(r, "revision")
+
+	revisionNumber, err := strconv.Atoi(revStr)
+	if err != nil {
+		httpError(w, "invalid revision number", http.StatusBadRequest)
+		return
+	}
+
+	revision, err := h.db.GetRevision(r.Context(), appID, revisionNumber)
+	if err != nil {
+		httpError(w, "revision not found", http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(revision)
+}
+
+func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	// Parse optional revision number from request body
+	var req struct {
+		Revision *int `json:"revision"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	var targetRevision *db.AppRevision
+
+	if req.Revision != nil {
+		// Rollback to specific revision
+		targetRevision, err = h.db.GetRevision(r.Context(), appID, *req.Revision)
+		if err != nil {
+			httpError(w, "revision not found", http.StatusNotFound)
+			return
+		}
+	} else {
+		// Rollback to previous revision (current - 1)
+		if app.CurrentRevision <= 1 {
+			httpError(w, "no previous revision to rollback to", http.StatusBadRequest)
+			return
+		}
+		targetRevision, err = h.db.GetRevision(r.Context(), appID, app.CurrentRevision-1)
+		if err != nil {
+			httpError(w, "previous revision not found", http.StatusNotFound)
+			return
+		}
+	}
+
+	// Apply revision configuration to app
+	cpuReq := ""
+	if targetRevision.CPURequest != nil {
+		cpuReq = *targetRevision.CPURequest
+	}
+	cpuLim := ""
+	if targetRevision.CPULimit != nil {
+		cpuLim = *targetRevision.CPULimit
+	}
+	memReq := ""
+	if targetRevision.MemoryRequest != nil {
+		memReq = *targetRevision.MemoryRequest
+	}
+	memLim := ""
+	if targetRevision.MemoryLimit != nil {
+		memLim = *targetRevision.MemoryLimit
+	}
+
+	_, err = h.db.UpdateApp(r.Context(), db.UpdateAppParams{
+		ID:           appID,
+		Image:        targetRevision.Image,
+		Replicas:     targetRevision.Replicas,
+		EnvVars:      targetRevision.EnvVars,
+		CPURequest:   cpuReq,
+		CPULimit:     cpuLim,
+		MemRequest:   memReq,
+		MemLimit:     memLim,
+		HealthPath:   targetRevision.HealthPath,
+		HealthPort:   targetRevision.HealthPort,
+		HealthDelay:  targetRevision.HealthDelay,
+		HealthPeriod: targetRevision.HealthPeriod,
+	})
+	if err != nil {
+		httpError(w, "failed to update app configuration", http.StatusInternalServerError)
+		return
+	}
+
+	// Get cluster for deployment
+	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
+	if err != nil {
+		httpError(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	// Decrypt kubeconfig
+	kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to decrypt kubeconfig", http.StatusInternalServerError)
+		return
+	}
+
+	// Update status to deploying
+	h.db.UpdateAppStatus(r.Context(), appID, "rolling_back", nil)
+
+	// Re-fetch app with updated config and deploy
+	updatedApp, _ := h.db.GetApp(r.Context(), appID)
+	go h.deployApp(appID, updatedApp, kubeconfig)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":            "rolling_back",
+		"target_revision":   targetRevision.RevisionNumber,
+		"target_image":      targetRevision.Image,
+	})
 }
 
 func httpError(w http.ResponseWriter, message string, code int) {
