@@ -20,6 +20,7 @@ interface AppWithContext extends App {
 export default function Dashboard() {
   const [showCreate, setShowCreate] = useState(false);
   const [selectedClusterId, setSelectedClusterId] = useState<string>('');
+  const [filterProjectId, setFilterProjectId] = useState<string>('all');
   const [newApp, setNewApp] = useState<CreateAppRequest>({
     name: '',
     image: 'nginx:latest',
@@ -152,15 +153,46 @@ export default function Dashboard() {
     );
   }
 
+  // Filter apps and clusters by selected project
+  const filteredClusters = filterProjectId === 'all'
+    ? allClusters
+    : allClusters.filter((c: Cluster & { project_name: string, project_id?: string }) => {
+        const project = projects.find(p => p.name === c.project_name);
+        return project?.id === filterProjectId;
+      });
+
+  const filteredApps = filterProjectId === 'all'
+    ? allApps
+    : allApps.filter(app => {
+        const project = projects.find(p => p.name === app.project_name);
+        return project?.id === filterProjectId;
+      });
+
   return (
     <div>
       {/* Header */}
       <div className="flex justify-between items-center mb-8">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Applications</h1>
-          <p className="text-gray-500 mt-1">
-            {allApps.length} app{allApps.length !== 1 ? 's' : ''} across {allClusters.length} cluster{allClusters.length !== 1 ? 's' : ''}
-          </p>
+        <div className="flex items-center gap-4">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900">Applications</h1>
+            <p className="text-gray-500 mt-1">
+              {filteredApps.length} app{filteredApps.length !== 1 ? 's' : ''} across {filteredClusters.length} cluster{filteredClusters.length !== 1 ? 's' : ''}
+            </p>
+          </div>
+          {projects.length > 1 && (
+            <select
+              value={filterProjectId}
+              onChange={(e) => setFilterProjectId(e.target.value)}
+              className="ml-4 px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+            >
+              <option value="all">All Projects</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
         <button
           onClick={() => setShowCreate(true)}
@@ -260,7 +292,7 @@ export default function Dashboard() {
       )}
 
       {/* Empty State */}
-      {allApps.length === 0 && allClusters.length > 0 && (
+      {filteredApps.length === 0 && filteredClusters.length > 0 && (
         <div className="text-center py-16 bg-white rounded-xl border border-gray-200">
           <div className="w-16 h-16 mx-auto mb-4 bg-indigo-100 rounded-full flex items-center justify-center">
             <svg className="w-8 h-8 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -279,7 +311,7 @@ export default function Dashboard() {
       )}
 
       {/* No Clusters State */}
-      {allClusters.length === 0 && (
+      {filteredClusters.length === 0 && (
         <div className="text-center py-16 bg-white rounded-xl border border-gray-200">
           <div className="w-16 h-16 mx-auto mb-4 bg-yellow-100 rounded-full flex items-center justify-center">
             <svg className="w-8 h-8 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -295,9 +327,9 @@ export default function Dashboard() {
       )}
 
       {/* Apps Grid */}
-      {allApps.length > 0 && (
+      {filteredApps.length > 0 && (
         <div className="space-y-4">
-          {allApps.map((app) => (
+          {filteredApps.map((app) => (
             <div
               key={app.id}
               className="bg-white rounded-xl border border-gray-200 p-5 hover:shadow-md transition-shadow"
@@ -384,7 +416,7 @@ export default function Dashboard() {
       )}
 
       {/* Quick Links */}
-      {allApps.length > 0 && (
+      {filteredApps.length > 0 && (
         <div className="mt-8 pt-6 border-t border-gray-200">
           <h3 className="text-sm font-medium text-gray-500 mb-3">Quick Links</h3>
           <div className="flex gap-4">
