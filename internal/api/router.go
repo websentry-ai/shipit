@@ -80,6 +80,10 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 				r.Get("/", h.ListRevisions)
 				r.Get("/{revision}", h.GetRevision)
 			})
+
+			// Autoscaling (HPA)
+			r.Get("/autoscaling", h.GetAutoscaling)
+			r.Put("/autoscaling", h.SetAutoscaling)
 		})
 	})
 

@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -47,11 +48,12 @@ func (h *Handler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer logStream.Close()
 
-	// Set headers for streaming
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	// Set headers for SSE streaming
+	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -61,8 +63,8 @@ func (h *Handler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 
 	scanner := bufio.NewScanner(logStream)
 	for scanner.Scan() {
-		w.Write(scanner.Bytes())
-		w.Write([]byte("\n"))
+		// SSE format: data: <content>\n\n
+		fmt.Fprintf(w, "data: %s\n\n", scanner.Text())
 		flusher.Flush()
 
 		// Check if client disconnected

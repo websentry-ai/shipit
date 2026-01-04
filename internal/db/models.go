@@ -58,6 +58,13 @@ type App struct {
 
 	// Revision tracking
 	CurrentRevision int `db:"current_revision" json:"current_revision"`
+
+	// HPA (auto-scaling) configuration
+	HPAEnabled   bool  `db:"hpa_enabled" json:"hpa_enabled"`
+	MinReplicas  *int  `db:"min_replicas" json:"min_replicas,omitempty"`
+	MaxReplicas  *int  `db:"max_replicas" json:"max_replicas,omitempty"`
+	CPUTarget    *int  `db:"cpu_target" json:"cpu_target,omitempty"`
+	MemoryTarget *int  `db:"memory_target" json:"memory_target,omitempty"`
 }
 
 // AppRevision stores a snapshot of app configuration at deploy time
@@ -79,6 +86,13 @@ type AppRevision struct {
 	HealthPeriod   *int            `db:"health_period" json:"health_period,omitempty"`
 	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
 	DeployedBy     *string         `db:"deployed_by" json:"deployed_by,omitempty"`
+
+	// HPA snapshot
+	HPAEnabled   bool `db:"hpa_enabled" json:"hpa_enabled"`
+	MinReplicas  *int `db:"min_replicas" json:"min_replicas,omitempty"`
+	MaxReplicas  *int `db:"max_replicas" json:"max_replicas,omitempty"`
+	CPUTarget    *int `db:"cpu_target" json:"cpu_target,omitempty"`
+	MemoryTarget *int `db:"memory_target" json:"memory_target,omitempty"`
 }
 
 type AppSecret struct {

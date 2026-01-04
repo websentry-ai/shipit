@@ -7,6 +7,8 @@ import type {
   AppStatus,
   CreateAppRequest,
   UpdateAppRequest,
+  HPAStatus,
+  HPAConfig,
 } from '../types';
 
 const API_BASE = '/api';
@@ -190,4 +192,19 @@ export function streamLogs(
   // For now, we'll append token as query param (less secure but works)
   const urlWithAuth = token ? `${url}&token=${token}` : url;
   return new EventSource(urlWithAuth);
+}
+
+// Autoscaling
+export async function getAutoscaling(appId: string): Promise<HPAStatus> {
+  return request<HPAStatus>(`/apps/${appId}/autoscaling`);
+}
+
+export async function setAutoscaling(
+  appId: string,
+  config: HPAConfig
+): Promise<HPAStatus> {
+  return request<HPAStatus>(`/apps/${appId}/autoscaling`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
 }

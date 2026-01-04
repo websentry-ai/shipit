@@ -198,6 +198,31 @@ func (db *DB) UpdateAppStatus(ctx context.Context, id, status string, message *s
 	return err
 }
 
+// UpdateAppHPAParams contains HPA configuration for an app
+type UpdateAppHPAParams struct {
+	ID           string
+	HPAEnabled   bool
+	MinReplicas  *int
+	MaxReplicas  *int
+	CPUTarget    *int
+	MemoryTarget *int
+}
+
+func (db *DB) UpdateAppHPA(ctx context.Context, p UpdateAppHPAParams) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		UPDATE apps SET
+			hpa_enabled = $1,
+			min_replicas = $2,
+			max_replicas = $3,
+			cpu_target = $4,
+			memory_target = $5,
+			updated_at = NOW()
+		WHERE id = $6 RETURNING *
+	`, p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.ID)
+	return &a, err
+}
+
 func (db *DB) DeleteApp(ctx context.Context, id string) error {
 	_, err := db.ExecContext(ctx, `DELETE FROM apps WHERE id = $1`, id)
 	return err
@@ -266,6 +291,12 @@ type CreateRevisionParams struct {
 	HealthPort     *int
 	HealthDelay    *int
 	HealthPeriod   *int
+	// HPA fields
+	HPAEnabled   bool
+	MinReplicas  *int
+	MaxReplicas  *int
+	CPUTarget    *int
+	MemoryTarget *int
 }
 
 func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppRevision, error) {
@@ -273,12 +304,14 @@ func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppR
 	err := db.GetContext(ctx, &r, `
 		INSERT INTO app_revisions (app_id, revision_number, image, replicas, port, env_vars,
 			cpu_request, cpu_limit, memory_request, memory_limit,
-			health_path, health_port, health_initial_delay, health_period)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			health_path, health_port, health_initial_delay, health_period,
+			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		RETURNING *
 	`, p.AppID, p.RevisionNumber, p.Image, p.Replicas, p.Port, p.EnvVars,
 		p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit,
-		p.HealthPath, p.HealthPort, p.HealthDelay, p.HealthPeriod)
+		p.HealthPath, p.HealthPort, p.HealthDelay, p.HealthPeriod,
+		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget)
 	return &r, err
 }
 

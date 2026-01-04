@@ -13,7 +13,7 @@ This document tracks planned features, development phases, implementation detail
 | Phase | Status | Completion |
 |-------|--------|------------|
 | Phase 1: Core Platform | ✅ Complete | 100% |
-| Phase 2: Production Readiness | 🟡 In Progress | 80% (HPA remaining) |
+| Phase 2: Production Readiness | ✅ Complete | 100% |
 | Phase 3: Developer Experience | 🟡 In Progress | 50% (Web Dashboard done) |
 | Phase 4: Enterprise Features | ⬜ Not Started | 0% |
 
@@ -101,7 +101,7 @@ api_tokens (id, token_hash, name, created_at)
 | **Health checks** | Liveness and readiness probes configuration per app | ✅ Done |
 | **Rollbacks** | Revert to previous app revision | ✅ Done |
 | **Resource limits** | CPU/memory requests and limits per app | ✅ Done |
-| **HPA (auto-scaling)** | Horizontal Pod Autoscaler with min/max replicas and CPU target | 🔴 Next Up |
+| **HPA (auto-scaling)** | Horizontal Pod Autoscaler with min/max replicas and CPU target | ✅ Done |
 
 ### P2 - Enhanced Operations
 
@@ -170,7 +170,7 @@ api_tokens (id, token_hash, name, created_at)
 
 ## Implementation Details
 
-### HPA Auto-scaling (P1) - NEXT UP
+### HPA Auto-scaling (P1) - ✅ COMPLETED
 
 ```bash
 shipit apps create <cluster-id> \
@@ -330,8 +330,8 @@ shipit_api_request_duration_seconds{method="...", path="..."}
 1. **Test Cluster** - Provision AWS EKS test cluster (`eksctl create cluster -f infra/eksctl-test-cluster.yaml`)
 2. **Deploy Test App** - Simple nginx app for testing new features
 
-### Short-term (Complete P1)
-3. **HPA Auto-scaling** - Last P1 feature, completes production readiness
+### Short-term (Complete P1) - ✅ DONE
+3. **HPA Auto-scaling** - ✅ Completed (2025-01-03)
 
 ### Dashboard Enhancements
 4. **Live K8s Status** - Show real pod status from cluster (not just DB status)
@@ -626,4 +626,5 @@ When implementing features:
 | v0.3.0 | Jan 2026 | Health checks, resource limits |
 | v0.4.0 | Jan 2026 | Rollbacks, revisions |
 | v0.5.0 | Jan 2026 | Web dashboard, environment variables |
-| v0.6.0 | TBD | HPA auto-scaling |
+| v0.6.0 | Jan 2026 | HPA auto-scaling |
+| v0.7.0 | TBD | Custom domains & Ingress |
