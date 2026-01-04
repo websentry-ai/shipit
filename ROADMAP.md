@@ -6,7 +6,7 @@ This document tracks planned features, development phases, implementation detail
 
 ## Current Status Summary
 
-**Version:** v0.5.0-envvars
+**Version:** v0.7.0-custom-domains
 **Last Updated:** January 2026
 **Production URL:** https://shipit.unboundsec.dev
 
@@ -14,6 +14,7 @@ This document tracks planned features, development phases, implementation detail
 |-------|--------|------------|
 | Phase 1: Core Platform | ✅ Complete | 100% |
 | Phase 2: Production Readiness | ✅ Complete | 100% |
+| Phase 2.5: Custom Domains | ✅ Complete | 100% |
 | Phase 3: Developer Experience | 🟡 In Progress | 50% (Web Dashboard done) |
 | Phase 4: Enterprise Features | ⬜ Not Started | 0% |
 
@@ -108,7 +109,7 @@ api_tokens (id, token_hash, name, created_at)
 | Feature | Description | Status |
 |---------|-------------|--------|
 | **App revisions** | Track configuration changes, enable rollback to specific versions | ✅ Done |
-| **Ingress per app** | Custom domains with automatic TLS certificates for deployed apps | Planned |
+| **Ingress per app** | Custom domains with automatic TLS certificates for deployed apps | ✅ Done |
 | **Metrics/monitoring** | Prometheus metrics endpoint, resource usage tracking | Planned |
 | **Namespaces** | Organize apps into namespaces within clusters | Planned |
 
@@ -222,20 +223,37 @@ hpa := &autoscalingv2.HorizontalPodAutoscaler{
 3. Add CLI flags in `cmd/shipit/apps.go`
 4. Add UI controls in `web/src/pages/AppDetail.tsx`
 
-### Ingress Per App (P2)
+### Ingress Per App (P2) - ✅ COMPLETED
 
-```bash
-shipit apps create <cluster-id> \
-  --name myapp \
-  --image nginx \
-  --domain myapp.example.com
-```
+**API Endpoints:**
+- `GET /apps/{id}/domain` - Get domain status and Ingress info
+- `PUT /apps/{id}/domain` - Set/update/remove custom domain
 
 **Implementation:**
-- Add `domain` column to apps table
-- Create Ingress resource with nginx ingress class
-- Use cert-manager for automatic TLS (requires cluster setup)
-- Requires DNS CNAME pointing to cluster ingress load balancer
+1. Database migration (`006_custom_domains.sql`):
+```sql
+ALTER TABLE apps ADD COLUMN domain VARCHAR(255);
+ALTER TABLE apps ADD COLUMN domain_status VARCHAR(50);
+ALTER TABLE app_revisions ADD COLUMN domain VARCHAR(255);
+```
+
+2. K8s Ingress operations in `internal/k8s/client.go`:
+```go
+// CreateOrUpdateIngress creates/updates Ingress with TLS via cert-manager
+func (c *Client) CreateOrUpdateIngress(name, namespace, domain string, port int) error
+func (c *Client) GetIngress(name, namespace string) (*IngressStatus, error)
+func (c *Client) DeleteIngress(name, namespace string) error
+```
+
+3. Frontend Domain tab with:
+   - Status indicator (pending/provisioning/active)
+   - Domain configuration form
+   - DNS setup instructions with load balancer endpoint
+
+**Requirements:**
+- nginx-ingress controller installed in cluster
+- cert-manager with Let's Encrypt ClusterIssuer
+- DNS CNAME pointing to cluster ingress load balancer
 
 ### Git-Based Deploy (Phase 3)
 
@@ -380,6 +398,10 @@ POST   /api/apps/{appID}/deploy
 GET    /api/apps/{appID}/status
 GET    /api/apps/{appID}/logs?tail=100&follow=true
 POST   /api/apps/{appID}/rollback
+GET    /api/apps/{appID}/autoscaling
+PUT    /api/apps/{appID}/autoscaling
+GET    /api/apps/{appID}/domain
+PUT    /api/apps/{appID}/domain
 
 # Revisions
 GET    /api/apps/{appID}/revisions
@@ -627,4 +649,6 @@ When implementing features:
 | v0.4.0 | Jan 2026 | Rollbacks, revisions |
 | v0.5.0 | Jan 2026 | Web dashboard, environment variables |
 | v0.6.0 | Jan 2026 | HPA auto-scaling |
-| v0.7.0 | TBD | Custom domains & Ingress |
+| v0.7.0 | Jan 2026 | Custom domains & Ingress |
+| v0.8.0 | TBD | Pre-deploy hooks |
+| v0.9.0 | TBD | Google SSO |
