@@ -464,6 +464,12 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		HealthPort:     app.HealthPort,
 		HealthDelay:    app.HealthInitialDelay,
 		HealthPeriod:   app.HealthPeriod,
+		// HPA config snapshot
+		HPAEnabled:   app.HPAEnabled,
+		MinReplicas:  app.MinReplicas,
+		MaxReplicas:  app.MaxReplicas,
+		CPUTarget:    app.CPUTarget,
+		MemoryTarget: app.MemoryTarget,
 	})
 	if err != nil {
 		msg := "failed to create revision: " + err.Error()
@@ -782,6 +788,151 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 		"target_revision":   targetRevision.RevisionNumber,
 		"target_image":      targetRevision.Image,
 	})
+}
+
+// Autoscaling (HPA)
+
+func (h *Handler) GetAutoscaling(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
+	if err != nil {
+		httpError(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to decrypt kubeconfig", http.StatusInternalServerError)
+		return
+	}
+
+	client, err := k8s.NewClient(kubeconfig)
+	if err != nil {
+		httpError(w, "failed to connect to cluster", http.StatusInternalServerError)
+		return
+	}
+
+	status, err := client.GetHPA(app.Name, app.Namespace)
+	if err != nil {
+		httpError(w, "failed to get autoscaling status: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(status)
+}
+
+func (h *Handler) SetAutoscaling(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	var req struct {
+		Enabled          bool   `json:"enabled"`
+		MinReplicas      *int32 `json:"min_replicas"`
+		MaxReplicas      *int32 `json:"max_replicas"`
+		TargetCPUPercent *int32 `json:"target_cpu_percent"`
+		TargetMemPercent *int32 `json:"target_memory_percent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
+	if err != nil {
+		httpError(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to decrypt kubeconfig", http.StatusInternalServerError)
+		return
+	}
+
+	client, err := k8s.NewClient(kubeconfig)
+	if err != nil {
+		httpError(w, "failed to connect to cluster", http.StatusInternalServerError)
+		return
+	}
+
+	// Set defaults
+	minReplicas := int32(1)
+	if req.MinReplicas != nil {
+		minReplicas = *req.MinReplicas
+	}
+	maxReplicas := int32(10)
+	if req.MaxReplicas != nil {
+		maxReplicas = *req.MaxReplicas
+	}
+
+	// Validate
+	if minReplicas < 1 {
+		httpError(w, "min_replicas must be at least 1", http.StatusBadRequest)
+		return
+	}
+	if maxReplicas < minReplicas {
+		httpError(w, "max_replicas must be >= min_replicas", http.StatusBadRequest)
+		return
+	}
+
+	config := k8s.HPAConfig{
+		Enabled:          req.Enabled,
+		MinReplicas:      minReplicas,
+		MaxReplicas:      maxReplicas,
+		TargetCPUPercent: req.TargetCPUPercent,
+		TargetMemPercent: req.TargetMemPercent,
+	}
+
+	if err := client.CreateOrUpdateHPA(app.Name, app.Namespace, config); err != nil {
+		httpError(w, "failed to update autoscaling: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Persist HPA config to database
+	minRep := int(minReplicas)
+	maxRep := int(maxReplicas)
+	var cpuTgt, memTgt *int
+	if req.TargetCPUPercent != nil {
+		v := int(*req.TargetCPUPercent)
+		cpuTgt = &v
+	}
+	if req.TargetMemPercent != nil {
+		v := int(*req.TargetMemPercent)
+		memTgt = &v
+	}
+	_, err = h.db.UpdateAppHPA(r.Context(), db.UpdateAppHPAParams{
+		ID:           appID,
+		HPAEnabled:   req.Enabled,
+		MinReplicas:  &minRep,
+		MaxReplicas:  &maxRep,
+		CPUTarget:    cpuTgt,
+		MemoryTarget: memTgt,
+	})
+	if err != nil {
+		httpError(w, "failed to save autoscaling config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Fetch and return updated status
+	status, err := client.GetHPA(app.Name, app.Namespace)
+	if err != nil {
+		httpError(w, "failed to get autoscaling status: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(status)
 }
 
 func httpError(w http.ResponseWriter, message string, code int) {

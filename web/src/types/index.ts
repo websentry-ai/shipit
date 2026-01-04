@@ -113,3 +113,23 @@ export interface UpdateAppRequest {
   health_initial_delay?: number;
   health_period?: number;
 }
+
+export interface HPAStatus {
+  enabled: boolean;
+  min_replicas: number;
+  max_replicas: number;
+  current_replicas: number;
+  desired_replicas: number;
+  current_cpu_percent?: number;
+  current_memory_percent?: number;
+  target_cpu_percent?: number;
+  target_memory_percent?: number;
+}
+
+export interface HPAConfig {
+  enabled: boolean;
+  min_replicas?: number;
+  max_replicas?: number;
+  target_cpu_percent?: number;
+  target_memory_percent?: number;
+}

@@ -13,8 +13,10 @@ import {
   setSecret,
   deleteSecret,
   streamLogs,
+  getAutoscaling,
+  setAutoscaling,
 } from '../api/client';
-import type { AppRevision, AppSecret, UpdateAppRequest } from '../types';
+import type { AppRevision, AppSecret, UpdateAppRequest, HPAConfig } from '../types';
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -50,7 +52,7 @@ export default function AppDetail() {
   const { appId } = useParams<{ appId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'revisions' | 'logs'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'autoscaling' | 'revisions' | 'logs'>('overview');
   const [logs, setLogs] = useState<string[]>([]);
   const [showSecretModal, setShowSecretModal] = useState(false);
   const [newSecretKey, setNewSecretKey] = useState('');
@@ -88,6 +90,12 @@ export default function AppDetail() {
     queryKey: ['secrets', appId],
     queryFn: () => listSecrets(appId!),
     enabled: !!appId && activeTab === 'secrets',
+  });
+
+  const { data: autoscaling, isLoading: autoscalingLoading } = useQuery({
+    queryKey: ['autoscaling', appId],
+    queryFn: () => getAutoscaling(appId!),
+    enabled: !!appId && activeTab === 'autoscaling',
   });
 
   const deployMutation = useMutation({
@@ -134,6 +142,13 @@ export default function AppDetail() {
     mutationFn: (data: UpdateAppRequest) => updateApp(appId!, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['app', appId] });
+    },
+  });
+
+  const autoscalingMutation = useMutation({
+    mutationFn: (config: HPAConfig) => setAutoscaling(appId!, config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['autoscaling', appId] });
     },
   });
 
@@ -321,6 +336,7 @@ export default function AppDetail() {
           <Tab active={activeTab === 'overview'} onClick={() => setActiveTab('overview')}>Overview</Tab>
           <Tab active={activeTab === 'env'} onClick={() => setActiveTab('env')}>Environment</Tab>
           <Tab active={activeTab === 'secrets'} onClick={() => setActiveTab('secrets')}>Secrets</Tab>
+          <Tab active={activeTab === 'autoscaling'} onClick={() => setActiveTab('autoscaling')}>Autoscaling</Tab>
           <Tab active={activeTab === 'revisions'} onClick={() => setActiveTab('revisions')}>Revisions</Tab>
           <Tab active={activeTab === 'logs'} onClick={() => setActiveTab('logs')}>Logs</Tab>
         </nav>
@@ -334,11 +350,33 @@ export default function AppDetail() {
             <dl className="space-y-3">
               <div className="flex justify-between">
                 <dt className="text-sm text-gray-500">Image</dt>
-                <dd className="text-sm text-gray-900 font-mono">{app.image}</dd>
+                <dd className="text-sm text-gray-900 font-mono truncate max-w-xs" title={app.image}>{app.image}</dd>
               </div>
-              <div className="flex justify-between">
+              <div className="flex justify-between items-center">
                 <dt className="text-sm text-gray-500">Replicas</dt>
-                <dd className="text-sm text-gray-900">{app.replicas}</dd>
+                <dd className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      if (app.replicas > 1) {
+                        updateAppMutation.mutate({ replicas: app.replicas - 1 });
+                      }
+                    }}
+                    disabled={app.replicas <= 1 || updateAppMutation.isPending}
+                    className="w-8 h-8 flex items-center justify-center rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-gray-700 font-bold"
+                  >
+                    −
+                  </button>
+                  <span className="w-8 text-center text-sm font-medium">{app.replicas}</span>
+                  <button
+                    onClick={() => {
+                      updateAppMutation.mutate({ replicas: app.replicas + 1 });
+                    }}
+                    disabled={updateAppMutation.isPending}
+                    className="w-8 h-8 flex items-center justify-center rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-gray-700 font-bold"
+                  >
+                    +
+                  </button>
+                </dd>
               </div>
               <div className="flex justify-between">
                 <dt className="text-sm text-gray-500">Port</dt>
@@ -569,6 +607,177 @@ export default function AppDetail() {
           <p className="p-4 text-sm text-gray-500 border-t border-gray-200">
             Redeploy the app after adding or updating secrets for changes to take effect.
           </p>
+        </div>
+      )}
+
+      {activeTab === 'autoscaling' && (
+        <div className="bg-white rounded-lg border border-gray-200">
+          <div className="p-4 border-b border-gray-200">
+            <h3 className="text-lg font-medium text-gray-900">Horizontal Pod Autoscaler</h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Automatically scale your app based on CPU or memory utilization.
+            </p>
+          </div>
+
+          {autoscalingLoading ? (
+            <div className="flex justify-center py-12">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
+            </div>
+          ) : (
+            <div className="p-6">
+              {/* Current Status */}
+              {autoscaling?.enabled && (
+                <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                    <span className="text-sm font-medium text-green-800">Autoscaling Active</span>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                    <div>
+                      <span className="text-gray-500">Current Replicas:</span>
+                      <span className="ml-2 font-medium">{autoscaling.current_replicas}</span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Desired:</span>
+                      <span className="ml-2 font-medium">{autoscaling.desired_replicas}</span>
+                    </div>
+                    {autoscaling.current_cpu_percent !== undefined && (
+                      <div>
+                        <span className="text-gray-500">CPU Usage:</span>
+                        <span className="ml-2 font-medium">{autoscaling.current_cpu_percent}%</span>
+                      </div>
+                    )}
+                    {autoscaling.current_memory_percent !== undefined && (
+                      <div>
+                        <span className="text-gray-500">Memory Usage:</span>
+                        <span className="ml-2 font-medium">{autoscaling.current_memory_percent}%</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Configuration Form */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const formData = new FormData(e.currentTarget);
+                  const config: HPAConfig = {
+                    enabled: formData.get('enabled') === 'on',
+                    min_replicas: parseInt(formData.get('min_replicas') as string) || 1,
+                    max_replicas: parseInt(formData.get('max_replicas') as string) || 10,
+                    target_cpu_percent: formData.get('target_cpu')
+                      ? parseInt(formData.get('target_cpu') as string)
+                      : undefined,
+                    target_memory_percent: formData.get('target_memory')
+                      ? parseInt(formData.get('target_memory') as string)
+                      : undefined,
+                  };
+                  autoscalingMutation.mutate(config);
+                }}
+                className="space-y-6"
+              >
+                {/* Enable Toggle */}
+                <div className="flex items-center gap-3">
+                  <input
+                    type="checkbox"
+                    name="enabled"
+                    id="hpa-enabled"
+                    defaultChecked={autoscaling?.enabled}
+                    className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <label htmlFor="hpa-enabled" className="text-sm font-medium text-gray-700">
+                    Enable autoscaling
+                  </label>
+                </div>
+
+                {/* Replica Range */}
+                <div className="grid grid-cols-2 gap-6">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Minimum Replicas
+                    </label>
+                    <input
+                      type="number"
+                      name="min_replicas"
+                      min="1"
+                      max="100"
+                      defaultValue={autoscaling?.min_replicas || 1}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Maximum Replicas
+                    </label>
+                    <input
+                      type="number"
+                      name="max_replicas"
+                      min="1"
+                      max="100"
+                      defaultValue={autoscaling?.max_replicas || 10}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Target Metrics */}
+                <div className="grid grid-cols-2 gap-6">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Target CPU Utilization (%)
+                    </label>
+                    <input
+                      type="number"
+                      name="target_cpu"
+                      min="1"
+                      max="100"
+                      placeholder="e.g., 70"
+                      defaultValue={autoscaling?.target_cpu_percent || ''}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">Leave empty to disable CPU-based scaling</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Target Memory Utilization (%)
+                    </label>
+                    <input
+                      type="number"
+                      name="target_memory"
+                      min="1"
+                      max="100"
+                      placeholder="e.g., 80"
+                      defaultValue={autoscaling?.target_memory_percent || ''}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">Leave empty to disable memory-based scaling</p>
+                  </div>
+                </div>
+
+                {/* Submit Button */}
+                <div className="flex items-center gap-4">
+                  <button
+                    type="submit"
+                    disabled={autoscalingMutation.isPending}
+                    className="px-4 py-2 bg-indigo-600 text-white text-sm rounded-md hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {autoscalingMutation.isPending ? 'Saving...' : 'Save Configuration'}
+                  </button>
+                  {autoscalingMutation.isSuccess && (
+                    <span className="text-sm text-green-600">Saved successfully!</span>
+                  )}
+                  {autoscalingMutation.isError && (
+                    <span className="text-sm text-red-600">Error saving configuration</span>
+                  )}
+                </div>
+              </form>
+
+              <p className="mt-6 text-sm text-gray-500 border-t border-gray-200 pt-4">
+                Note: HPA requires resource requests (CPU/Memory) to be set on your app. Autoscaling changes take effect immediately without requiring a redeploy.
+              </p>
+            </div>
+          )}
         </div>
       )}
 

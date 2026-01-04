@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -48,11 +50,42 @@ type DeployRequest struct {
 }
 
 type DeploymentStatus struct {
-	Name              string `json:"name"`
-	Replicas          int32  `json:"replicas"`
-	ReadyReplicas     int32  `json:"ready_replicas"`
-	AvailableReplicas int32  `json:"available_replicas"`
-	Status            string `json:"status"`
+	Name            string      `json:"name"`
+	Replicas        int32       `json:"replicas"`
+	ReadyReplicas   int32       `json:"ready_replicas"`
+	DesiredReplicas int32       `json:"desired_replicas"`
+	Status          string      `json:"status"`
+	Pods            []PodStatus `json:"pods"`
+}
+
+type PodStatus struct {
+	Name     string `json:"name"`
+	Phase    string `json:"phase"`
+	Ready    bool   `json:"ready"`
+	Restarts int32  `json:"restarts"`
+	Age      string `json:"age"`
+}
+
+// HPAConfig represents Horizontal Pod Autoscaler configuration
+type HPAConfig struct {
+	Enabled           bool  `json:"enabled"`
+	MinReplicas       int32 `json:"min_replicas"`
+	MaxReplicas       int32 `json:"max_replicas"`
+	TargetCPUPercent  *int32 `json:"target_cpu_percent,omitempty"`
+	TargetMemPercent  *int32 `json:"target_memory_percent,omitempty"`
+}
+
+// HPAStatus represents the current state of an HPA
+type HPAStatus struct {
+	Enabled         bool   `json:"enabled"`
+	MinReplicas     int32  `json:"min_replicas"`
+	MaxReplicas     int32  `json:"max_replicas"`
+	CurrentReplicas int32  `json:"current_replicas"`
+	DesiredReplicas int32  `json:"desired_replicas"`
+	CurrentCPU      *int32 `json:"current_cpu_percent,omitempty"`
+	CurrentMemory   *int32 `json:"current_memory_percent,omitempty"`
+	TargetCPU       *int32 `json:"target_cpu_percent,omitempty"`
+	TargetMemory    *int32 `json:"target_memory_percent,omitempty"`
 }
 
 func NewClient(kubeconfig []byte) (*Client, error) {
@@ -365,8 +398,9 @@ func (c *Client) DeleteSecret(name, namespace string) error {
 }
 
 func (c *Client) GetDeploymentStatus(name, namespace string) (*DeploymentStatus, error) {
-	deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(
-		context.Background(), name, metav1.GetOptions{})
+	ctx := context.Background()
+
+	deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -380,13 +414,62 @@ func (c *Client) GetDeploymentStatus(name, namespace string) (*DeploymentStatus,
 		status = "pending"
 	}
 
+	// Get pods for this deployment
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", name),
+	})
+
+	var podStatuses []PodStatus
+	if err == nil && pods != nil {
+		for _, pod := range pods.Items {
+			// Calculate age
+			age := time.Since(pod.CreationTimestamp.Time)
+			ageStr := formatDuration(age)
+
+			// Check if pod is ready
+			ready := false
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					ready = true
+					break
+				}
+			}
+
+			// Get restart count from container statuses
+			var restarts int32
+			for _, cs := range pod.Status.ContainerStatuses {
+				restarts += cs.RestartCount
+			}
+
+			podStatuses = append(podStatuses, PodStatus{
+				Name:     pod.Name,
+				Phase:    string(pod.Status.Phase),
+				Ready:    ready,
+				Restarts: restarts,
+				Age:      ageStr,
+			})
+		}
+	}
+
 	return &DeploymentStatus{
-		Name:              name,
-		Replicas:          *deployment.Spec.Replicas,
-		ReadyReplicas:     deployment.Status.ReadyReplicas,
-		AvailableReplicas: deployment.Status.AvailableReplicas,
-		Status:            status,
+		Name:            name,
+		Replicas:        *deployment.Spec.Replicas,
+		ReadyReplicas:   deployment.Status.ReadyReplicas,
+		DesiredReplicas: *deployment.Spec.Replicas,
+		Status:          status,
+		Pods:            podStatuses,
 	}, nil
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	} else if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	} else if d < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
 func (c *Client) GetLogs(appName, namespace string, follow bool, tail string) (io.ReadCloser, error) {
@@ -417,4 +500,161 @@ func (c *Client) GetLogs(appName, namespace string, follow bool, tail string) (i
 
 	req := c.clientset.CoreV1().Pods(namespace).GetLogs(podName, opts)
 	return req.Stream(context.Background())
+}
+
+// CreateOrUpdateHPA creates or updates a Horizontal Pod Autoscaler for a deployment
+func (c *Client) CreateOrUpdateHPA(name, namespace string, config HPAConfig) error {
+	ctx := context.Background()
+	hpaClient := c.clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace)
+
+	// If HPA is disabled, delete it if exists
+	if !config.Enabled {
+		err := hpaClient.Delete(ctx, name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete HPA: %w", err)
+		}
+		return nil
+	}
+
+	// Build metrics list
+	var metrics []autoscalingv2.MetricSpec
+
+	if config.TargetCPUPercent != nil && *config.TargetCPUPercent > 0 {
+		metrics = append(metrics, autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name: corev1.ResourceCPU,
+				Target: autoscalingv2.MetricTarget{
+					Type:               autoscalingv2.UtilizationMetricType,
+					AverageUtilization: config.TargetCPUPercent,
+				},
+			},
+		})
+	}
+
+	if config.TargetMemPercent != nil && *config.TargetMemPercent > 0 {
+		metrics = append(metrics, autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name: corev1.ResourceMemory,
+				Target: autoscalingv2.MetricTarget{
+					Type:               autoscalingv2.UtilizationMetricType,
+					AverageUtilization: config.TargetMemPercent,
+				},
+			},
+		})
+	}
+
+	// Default to CPU 80% if no metrics specified
+	if len(metrics) == 0 {
+		defaultCPU := int32(80)
+		metrics = append(metrics, autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name: corev1.ResourceCPU,
+				Target: autoscalingv2.MetricTarget{
+					Type:               autoscalingv2.UtilizationMetricType,
+					AverageUtilization: &defaultCPU,
+				},
+			},
+		})
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{"app": name, "managed-by": "shipit"},
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       name,
+			},
+			MinReplicas: &config.MinReplicas,
+			MaxReplicas: config.MaxReplicas,
+			Metrics:     metrics,
+		},
+	}
+
+	// Try to get existing HPA
+	existing, err := hpaClient.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Create new HPA
+			_, err = hpaClient.Create(ctx, hpa, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create HPA: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get HPA: %w", err)
+	}
+
+	// Update existing HPA
+	hpa.ResourceVersion = existing.ResourceVersion
+	_, err = hpaClient.Update(ctx, hpa, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update HPA: %w", err)
+	}
+
+	return nil
+}
+
+// GetHPA returns the current HPA status for a deployment
+func (c *Client) GetHPA(name, namespace string) (*HPAStatus, error) {
+	ctx := context.Background()
+	hpaClient := c.clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace)
+
+	hpa, err := hpaClient.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// No HPA exists - return disabled status
+			return &HPAStatus{Enabled: false}, nil
+		}
+		return nil, fmt.Errorf("failed to get HPA: %w", err)
+	}
+
+	status := &HPAStatus{
+		Enabled:         true,
+		MinReplicas:     *hpa.Spec.MinReplicas,
+		MaxReplicas:     hpa.Spec.MaxReplicas,
+		CurrentReplicas: hpa.Status.CurrentReplicas,
+		DesiredReplicas: hpa.Status.DesiredReplicas,
+	}
+
+	// Extract target metrics from spec
+	for _, metric := range hpa.Spec.Metrics {
+		if metric.Type == autoscalingv2.ResourceMetricSourceType && metric.Resource != nil {
+			if metric.Resource.Name == corev1.ResourceCPU {
+				status.TargetCPU = metric.Resource.Target.AverageUtilization
+			} else if metric.Resource.Name == corev1.ResourceMemory {
+				status.TargetMemory = metric.Resource.Target.AverageUtilization
+			}
+		}
+	}
+
+	// Extract current metrics from status
+	for _, metric := range hpa.Status.CurrentMetrics {
+		if metric.Type == autoscalingv2.ResourceMetricSourceType && metric.Resource != nil {
+			if metric.Resource.Name == corev1.ResourceCPU && metric.Resource.Current.AverageUtilization != nil {
+				status.CurrentCPU = metric.Resource.Current.AverageUtilization
+			} else if metric.Resource.Name == corev1.ResourceMemory && metric.Resource.Current.AverageUtilization != nil {
+				status.CurrentMemory = metric.Resource.Current.AverageUtilization
+			}
+		}
+	}
+
+	return status, nil
+}
+
+// DeleteHPA removes the HPA for a deployment
+func (c *Client) DeleteHPA(name, namespace string) error {
+	ctx := context.Background()
+	err := c.clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete HPA: %w", err)
+	}
+	return nil
 }
