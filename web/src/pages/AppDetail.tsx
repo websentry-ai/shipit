@@ -15,8 +15,10 @@ import {
   streamLogs,
   getAutoscaling,
   setAutoscaling,
+  getDomain,
+  setDomain,
 } from '../api/client';
-import type { AppRevision, AppSecret, UpdateAppRequest, HPAConfig } from '../types';
+import type { AppRevision, AppSecret, UpdateAppRequest, HPAConfig, DomainConfig } from '../types';
 
 function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
@@ -52,7 +54,7 @@ export default function AppDetail() {
   const { appId } = useParams<{ appId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'autoscaling' | 'revisions' | 'logs'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'autoscaling' | 'domain' | 'revisions' | 'logs'>('overview');
   const [logs, setLogs] = useState<string[]>([]);
   const [showSecretModal, setShowSecretModal] = useState(false);
   const [newSecretKey, setNewSecretKey] = useState('');
@@ -96,6 +98,12 @@ export default function AppDetail() {
     queryKey: ['autoscaling', appId],
     queryFn: () => getAutoscaling(appId!),
     enabled: !!appId && activeTab === 'autoscaling',
+  });
+
+  const { data: domainStatus, isLoading: domainLoading } = useQuery({
+    queryKey: ['domain', appId],
+    queryFn: () => getDomain(appId!),
+    enabled: !!appId && activeTab === 'domain',
   });
 
   const deployMutation = useMutation({
@@ -149,6 +157,14 @@ export default function AppDetail() {
     mutationFn: (config: HPAConfig) => setAutoscaling(appId!, config),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['autoscaling', appId] });
+    },
+  });
+
+  const domainMutation = useMutation({
+    mutationFn: (config: DomainConfig) => setDomain(appId!, config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['domain', appId] });
+      queryClient.invalidateQueries({ queryKey: ['app', appId] });
     },
   });
 
@@ -337,6 +353,7 @@ export default function AppDetail() {
           <Tab active={activeTab === 'env'} onClick={() => setActiveTab('env')}>Environment</Tab>
           <Tab active={activeTab === 'secrets'} onClick={() => setActiveTab('secrets')}>Secrets</Tab>
           <Tab active={activeTab === 'autoscaling'} onClick={() => setActiveTab('autoscaling')}>Autoscaling</Tab>
+          <Tab active={activeTab === 'domain'} onClick={() => setActiveTab('domain')}>Domain</Tab>
           <Tab active={activeTab === 'revisions'} onClick={() => setActiveTab('revisions')}>Revisions</Tab>
           <Tab active={activeTab === 'logs'} onClick={() => setActiveTab('logs')}>Logs</Tab>
         </nav>
@@ -776,6 +793,158 @@ export default function AppDetail() {
               <p className="mt-6 text-sm text-gray-500 border-t border-gray-200 pt-4">
                 Note: HPA requires resource requests (CPU/Memory) to be set on your app. Autoscaling changes take effect immediately without requiring a redeploy.
               </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'domain' && (
+        <div className="bg-white rounded-lg border border-gray-200">
+          <div className="p-4 border-b border-gray-200">
+            <h3 className="text-lg font-medium text-gray-900">Custom Domain</h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Configure a custom domain for your application with automatic TLS certificates.
+            </p>
+          </div>
+
+          {domainLoading ? (
+            <div className="flex justify-center py-12">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
+            </div>
+          ) : (
+            <div className="p-6">
+              {/* Current Status */}
+              {domainStatus?.domain && (
+                <div className={`mb-6 p-4 rounded-lg border ${
+                  domainStatus.domain_status === 'active'
+                    ? 'bg-green-50 border-green-200'
+                    : 'bg-yellow-50 border-yellow-200'
+                }`}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className={`w-2 h-2 rounded-full ${
+                      domainStatus.domain_status === 'active' ? 'bg-green-500' : 'bg-yellow-500'
+                    }`}></span>
+                    <span className={`text-sm font-medium ${
+                      domainStatus.domain_status === 'active' ? 'text-green-800' : 'text-yellow-800'
+                    }`}>
+                      {domainStatus.domain_status === 'active' ? 'Domain Active' : 'Provisioning...'}
+                    </span>
+                  </div>
+                  <div className="space-y-2 text-sm">
+                    <div>
+                      <span className="text-gray-500">Domain:</span>
+                      <a
+                        href={`https://${domainStatus.domain}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="ml-2 text-indigo-600 hover:text-indigo-800 font-medium"
+                      >
+                        {domainStatus.domain}
+                      </a>
+                    </div>
+                    {domainStatus.ingress && (
+                      <>
+                        <div>
+                          <span className="text-gray-500">TLS Enabled:</span>
+                          <span className="ml-2 font-medium">
+                            {domainStatus.ingress.tls_enabled ? 'Yes' : 'No'}
+                          </span>
+                        </div>
+                        {domainStatus.ingress.load_balancer && (
+                          <div>
+                            <span className="text-gray-500">Load Balancer:</span>
+                            <span className="ml-2 font-mono text-xs">
+                              {domainStatus.ingress.load_balancer}
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Configuration Form */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const formData = new FormData(e.currentTarget);
+                  const domain = formData.get('domain') as string;
+                  domainMutation.mutate({
+                    domain: domain.trim() || undefined,
+                  });
+                }}
+                className="space-y-6"
+              >
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Domain Name
+                  </label>
+                  <input
+                    type="text"
+                    name="domain"
+                    placeholder="app.example.com"
+                    defaultValue={domainStatus?.domain || ''}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Enter your custom domain (e.g., app.example.com). Leave empty to remove domain.
+                  </p>
+                </div>
+
+                {/* DNS Instructions */}
+                {domainStatus?.ingress?.load_balancer && (
+                  <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                    <h4 className="text-sm font-medium text-blue-800 mb-2">DNS Configuration</h4>
+                    <p className="text-sm text-blue-700 mb-2">
+                      Point your domain to the load balancer by creating a CNAME record:
+                    </p>
+                    <code className="block text-xs bg-blue-100 p-2 rounded font-mono">
+                      {domainStatus.domain} CNAME {domainStatus.ingress.load_balancer}
+                    </code>
+                  </div>
+                )}
+
+                {/* Submit Button */}
+                <div className="flex items-center gap-4">
+                  <button
+                    type="submit"
+                    disabled={domainMutation.isPending}
+                    className="px-4 py-2 bg-indigo-600 text-white text-sm rounded-md hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {domainMutation.isPending ? 'Saving...' : 'Save Domain'}
+                  </button>
+                  {domainStatus?.domain && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (confirm('Remove custom domain?')) {
+                          domainMutation.mutate({ domain: undefined });
+                        }
+                      }}
+                      disabled={domainMutation.isPending}
+                      className="px-4 py-2 text-red-600 hover:bg-red-50 text-sm rounded-md"
+                    >
+                      Remove Domain
+                    </button>
+                  )}
+                  {domainMutation.isSuccess && (
+                    <span className="text-sm text-green-600">Saved successfully!</span>
+                  )}
+                  {domainMutation.isError && (
+                    <span className="text-sm text-red-600">Error saving domain configuration</span>
+                  )}
+                </div>
+              </form>
+
+              <div className="mt-6 border-t border-gray-200 pt-4">
+                <h4 className="text-sm font-medium text-gray-700 mb-2">Prerequisites</h4>
+                <ul className="text-sm text-gray-500 list-disc list-inside space-y-1">
+                  <li>nginx-ingress controller must be installed on the cluster</li>
+                  <li>cert-manager must be installed for automatic TLS certificates</li>
+                  <li>DNS must be configured to point to the cluster's load balancer</li>
+                </ul>
+              </div>
             </div>
           )}
         </div>

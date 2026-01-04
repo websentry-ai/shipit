@@ -65,6 +65,10 @@ type App struct {
 	MaxReplicas  *int  `db:"max_replicas" json:"max_replicas,omitempty"`
 	CPUTarget    *int  `db:"cpu_target" json:"cpu_target,omitempty"`
 	MemoryTarget *int  `db:"memory_target" json:"memory_target,omitempty"`
+
+	// Custom domain configuration
+	Domain       *string `db:"domain" json:"domain,omitempty"`
+	DomainStatus *string `db:"domain_status" json:"domain_status,omitempty"`
 }
 
 // AppRevision stores a snapshot of app configuration at deploy time
@@ -93,6 +97,9 @@ type AppRevision struct {
 	MaxReplicas  *int `db:"max_replicas" json:"max_replicas,omitempty"`
 	CPUTarget    *int `db:"cpu_target" json:"cpu_target,omitempty"`
 	MemoryTarget *int `db:"memory_target" json:"memory_target,omitempty"`
+
+	// Domain snapshot
+	Domain *string `db:"domain" json:"domain,omitempty"`
 }
 
 type AppSecret struct {

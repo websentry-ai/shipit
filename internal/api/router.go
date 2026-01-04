@@ -84,6 +84,10 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 			// Autoscaling (HPA)
 			r.Get("/autoscaling", h.GetAutoscaling)
 			r.Put("/autoscaling", h.SetAutoscaling)
+
+			// Custom domains
+			r.Get("/domain", h.GetDomain)
+			r.Put("/domain", h.SetDomain)
 		})
 	})
 
