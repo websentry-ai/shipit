@@ -9,6 +9,8 @@ import type {
   UpdateAppRequest,
   HPAStatus,
   HPAConfig,
+  DomainStatus,
+  DomainConfig,
 } from '../types';
 
 const API_BASE = '/api';
@@ -204,6 +206,21 @@ export async function setAutoscaling(
   config: HPAConfig
 ): Promise<HPAStatus> {
   return request<HPAStatus>(`/apps/${appId}/autoscaling`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
+// Custom Domains
+export async function getDomain(appId: string): Promise<DomainStatus> {
+  return request<DomainStatus>(`/apps/${appId}/domain`);
+}
+
+export async function setDomain(
+  appId: string,
+  config: DomainConfig
+): Promise<DomainStatus> {
+  return request<DomainStatus>(`/apps/${appId}/domain`, {
     method: 'PUT',
     body: JSON.stringify(config),
   });

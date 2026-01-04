@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -655,6 +656,138 @@ func (c *Client) DeleteHPA(name, namespace string) error {
 	err := c.clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete HPA: %w", err)
+	}
+	return nil
+}
+
+// IngressStatus represents the status of an Ingress resource
+type IngressStatus struct {
+	Domain      string   `json:"domain"`
+	TLSEnabled  bool     `json:"tls_enabled"`
+	Ready       bool     `json:"ready"`
+	LoadBalancer string  `json:"load_balancer,omitempty"`
+	Hosts       []string `json:"hosts,omitempty"`
+}
+
+// CreateOrUpdateIngress creates or updates an Ingress resource for an app with TLS
+func (c *Client) CreateOrUpdateIngress(name, namespace, domain string, servicePort int) error {
+	ctx := context.Background()
+
+	pathType := networkingv1.PathTypePrefix
+	ingressClassName := "nginx"
+
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				"cert-manager.io/cluster-issuer":           "letsencrypt-prod",
+				"nginx.ingress.kubernetes.io/ssl-redirect": "true",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: &ingressClassName,
+			TLS: []networkingv1.IngressTLS{
+				{
+					Hosts:      []string{domain},
+					SecretName: fmt.Sprintf("%s-tls", name),
+				},
+			},
+			Rules: []networkingv1.IngressRule{
+				{
+					Host: domain,
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									Path:     "/",
+									PathType: &pathType,
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: name,
+											Port: networkingv1.ServiceBackendPort{
+												Number: int32(servicePort),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Try to get existing Ingress
+	existing, err := c.clientset.NetworkingV1().Ingresses(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Create new Ingress
+			_, err = c.clientset.NetworkingV1().Ingresses(namespace).Create(ctx, ingress, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create Ingress: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to get Ingress: %w", err)
+	}
+
+	// Update existing Ingress
+	ingress.ResourceVersion = existing.ResourceVersion
+	_, err = c.clientset.NetworkingV1().Ingresses(namespace).Update(ctx, ingress, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update Ingress: %w", err)
+	}
+
+	return nil
+}
+
+// GetIngress retrieves the Ingress status for an app
+func (c *Client) GetIngress(name, namespace string) (*IngressStatus, error) {
+	ctx := context.Background()
+
+	ingress, err := c.clientset.NetworkingV1().Ingresses(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get Ingress: %w", err)
+	}
+
+	status := &IngressStatus{
+		TLSEnabled: len(ingress.Spec.TLS) > 0,
+		Hosts:      make([]string, 0),
+	}
+
+	// Get domain from rules
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host != "" {
+			status.Domain = rule.Host
+			status.Hosts = append(status.Hosts, rule.Host)
+		}
+	}
+
+	// Check if LoadBalancer is assigned
+	if len(ingress.Status.LoadBalancer.Ingress) > 0 {
+		lb := ingress.Status.LoadBalancer.Ingress[0]
+		if lb.Hostname != "" {
+			status.LoadBalancer = lb.Hostname
+		} else if lb.IP != "" {
+			status.LoadBalancer = lb.IP
+		}
+		status.Ready = true
+	}
+
+	return status, nil
+}
+
+// DeleteIngress removes the Ingress resource for an app
+func (c *Client) DeleteIngress(name, namespace string) error {
+	ctx := context.Background()
+	err := c.clientset.NetworkingV1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete Ingress: %w", err)
 	}
 	return nil
 }

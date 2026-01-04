@@ -470,6 +470,8 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		MaxReplicas:  app.MaxReplicas,
 		CPUTarget:    app.CPUTarget,
 		MemoryTarget: app.MemoryTarget,
+		// Domain snapshot
+		Domain: app.Domain,
 	})
 	if err != nil {
 		msg := "failed to create revision: " + err.Error()
@@ -534,6 +536,27 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	h.db.UpdateAppRevision(ctx, appID, newRevision)
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
 
+	// Sync Ingress if domain is configured
+	if app.Domain != nil && *app.Domain != "" {
+		port := 80
+		if app.Port != nil {
+			port = *app.Port
+		}
+		if err := client.CreateOrUpdateIngress(app.Name, app.Namespace, *app.Domain, port); err != nil {
+			// Log but don't fail the deploy
+			msg := "warning: failed to sync ingress: " + err.Error()
+			h.db.UpdateAppStatus(ctx, appID, "running", &msg)
+		} else {
+			// Update domain status to active
+			activeStatus := "active"
+			h.db.UpdateAppDomain(ctx, db.UpdateAppDomainParams{
+				ID:           appID,
+				Domain:       app.Domain,
+				DomainStatus: &activeStatus,
+			})
+		}
+	}
+
 	// Clean up old revisions (keep last 10)
 	h.db.DeleteOldRevisions(ctx, appID, 10)
 }
@@ -558,6 +581,10 @@ func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		if client, err := k8s.NewClient(kubeconfig); err == nil {
 			client.DeleteApp(app.Name, app.Namespace)
+			// Also delete Ingress if domain was configured
+			if app.Domain != nil && *app.Domain != "" {
+				client.DeleteIngress(app.Name, app.Namespace)
+			}
 		}
 	}
 
@@ -933,6 +960,151 @@ func (h *Handler) SetAutoscaling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(status)
+}
+
+// Custom Domains
+
+func (h *Handler) GetDomain(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
+	if err != nil {
+		httpError(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to decrypt kubeconfig", http.StatusInternalServerError)
+		return
+	}
+
+	client, err := k8s.NewClient(kubeconfig)
+	if err != nil {
+		httpError(w, "failed to connect to cluster", http.StatusInternalServerError)
+		return
+	}
+
+	// Get Ingress status from K8s
+	ingressStatus, _ := client.GetIngress(app.Name, app.Namespace)
+
+	response := map[string]interface{}{
+		"domain":        app.Domain,
+		"domain_status": app.DomainStatus,
+	}
+
+	if ingressStatus != nil {
+		response["ingress"] = ingressStatus
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+func (h *Handler) SetDomain(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	var req struct {
+		Domain *string `json:"domain"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate domain format if provided
+	if req.Domain != nil && *req.Domain != "" {
+		// Check if domain is already in use by another app
+		existing, err := h.db.GetAppByDomain(r.Context(), *req.Domain)
+		if err == nil && existing.ID != appID {
+			httpError(w, "domain already in use by another app", http.StatusConflict)
+			return
+		}
+	}
+
+	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
+	if err != nil {
+		httpError(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to decrypt kubeconfig", http.StatusInternalServerError)
+		return
+	}
+
+	client, err := k8s.NewClient(kubeconfig)
+	if err != nil {
+		httpError(w, "failed to connect to cluster", http.StatusInternalServerError)
+		return
+	}
+
+	var domainStatus string
+
+	if req.Domain != nil && *req.Domain != "" {
+		// Create or update Ingress
+		port := 80
+		if app.Port != nil {
+			port = *app.Port
+		}
+
+		if err := client.CreateOrUpdateIngress(app.Name, app.Namespace, *req.Domain, port); err != nil {
+			httpError(w, "failed to create ingress: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		domainStatus = "provisioning"
+	} else {
+		// Delete Ingress if domain is being removed
+		if app.Domain != nil && *app.Domain != "" {
+			if err := client.DeleteIngress(app.Name, app.Namespace); err != nil {
+				// Log but don't fail - ingress might not exist
+			}
+		}
+		domainStatus = ""
+	}
+
+	// Update database
+	statusPtr := &domainStatus
+	if domainStatus == "" {
+		statusPtr = nil
+	}
+	updatedApp, err := h.db.UpdateAppDomain(r.Context(), db.UpdateAppDomainParams{
+		ID:           appID,
+		Domain:       req.Domain,
+		DomainStatus: statusPtr,
+	})
+	if err != nil {
+		httpError(w, "failed to update domain", http.StatusInternalServerError)
+		return
+	}
+
+	// Get updated Ingress status
+	var ingressStatus *k8s.IngressStatus
+	if req.Domain != nil && *req.Domain != "" {
+		ingressStatus, _ = client.GetIngress(app.Name, app.Namespace)
+	}
+
+	response := map[string]interface{}{
+		"domain":        updatedApp.Domain,
+		"domain_status": updatedApp.DomainStatus,
+	}
+	if ingressStatus != nil {
+		response["ingress"] = ingressStatus
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 func httpError(w http.ResponseWriter, message string, code int) {

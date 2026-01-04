@@ -39,6 +39,9 @@ export interface App {
   health_period?: number;
   // Revision tracking
   current_revision: number;
+  // Custom domain
+  domain?: string;
+  domain_status?: string;
 }
 
 export interface AppRevision {
@@ -132,4 +135,22 @@ export interface HPAConfig {
   max_replicas?: number;
   target_cpu_percent?: number;
   target_memory_percent?: number;
+}
+
+export interface IngressStatus {
+  domain: string;
+  tls_enabled: boolean;
+  ready: boolean;
+  load_balancer?: string;
+  hosts?: string[];
+}
+
+export interface DomainStatus {
+  domain?: string;
+  domain_status?: string;
+  ingress?: IngressStatus;
+}
+
+export interface DomainConfig {
+  domain?: string;
 }

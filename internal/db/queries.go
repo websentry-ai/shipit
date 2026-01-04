@@ -228,6 +228,31 @@ func (db *DB) DeleteApp(ctx context.Context, id string) error {
 	return err
 }
 
+// UpdateAppDomainParams contains domain configuration for an app
+type UpdateAppDomainParams struct {
+	ID           string
+	Domain       *string
+	DomainStatus *string
+}
+
+func (db *DB) UpdateAppDomain(ctx context.Context, p UpdateAppDomainParams) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		UPDATE apps SET
+			domain = $1,
+			domain_status = $2,
+			updated_at = NOW()
+		WHERE id = $3 RETURNING *
+	`, p.Domain, p.DomainStatus, p.ID)
+	return &a, err
+}
+
+func (db *DB) GetAppByDomain(ctx context.Context, domain string) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `SELECT * FROM apps WHERE domain = $1`, domain)
+	return &a, err
+}
+
 // Secret operations
 
 func (db *DB) ListSecrets(ctx context.Context, appID string) ([]AppSecret, error) {
@@ -297,6 +322,8 @@ type CreateRevisionParams struct {
 	MaxReplicas  *int
 	CPUTarget    *int
 	MemoryTarget *int
+	// Domain
+	Domain *string
 }
 
 func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppRevision, error) {
@@ -305,13 +332,13 @@ func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppR
 		INSERT INTO app_revisions (app_id, revision_number, image, replicas, port, env_vars,
 			cpu_request, cpu_limit, memory_request, memory_limit,
 			health_path, health_port, health_initial_delay, health_period,
-			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		RETURNING *
 	`, p.AppID, p.RevisionNumber, p.Image, p.Replicas, p.Port, p.EnvVars,
 		p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit,
 		p.HealthPath, p.HealthPort, p.HealthDelay, p.HealthPeriod,
-		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget)
+		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain)
 	return &r, err
 }
 
