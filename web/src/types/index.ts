@@ -42,6 +42,14 @@ export interface App {
   // Custom domain
   domain?: string;
   domain_status?: string;
+  // Pre-deploy hook
+  pre_deploy_command?: string;
+  // Porter migration fields (Phase 3)
+  service_name?: string;  // Service within the app (e.g., "gateway", "web")
+  app_group?: string;     // Logical app grouping (e.g., "staging-gateway")
+  managed_by: 'shipit' | 'porter';
+  porter_app_id?: string;
+  porter_app_url?: string;
 }
 
 export interface AppRevision {
@@ -62,6 +70,12 @@ export interface AppRevision {
   health_period?: number;
   created_at: string;
   deployed_by?: string;
+  // Deployment status
+  deploy_status: string;
+  deploy_message?: string;
+  deployed_at?: string;
+  // Pre-deploy hook
+  pre_deploy_command?: string;
 }
 
 export interface AppSecret {
@@ -84,6 +98,11 @@ export interface PodStatus {
   ready: boolean;
   restarts: number;
   age: string;
+  // Resource metrics (from metrics-server)
+  cpu_usage?: string;    // e.g., "50m" (millicores)
+  memory_usage?: string; // e.g., "128Mi"
+  cpu_percent?: number;  // percentage of limit
+  mem_percent?: number;  // percentage of limit
 }
 
 export interface CreateAppRequest {
@@ -153,4 +172,52 @@ export interface DomainStatus {
 
 export interface DomainConfig {
   domain?: string;
+}
+
+export interface PreDeployHookStatus {
+  pre_deploy_command?: string;
+}
+
+export interface PreDeployHookConfig {
+  command?: string;
+}
+
+// User types (SSO)
+export interface User {
+  id: string;
+  email: string;
+  name?: string;
+  picture_url?: string;
+  created_at: string;
+  last_login_at?: string;
+}
+
+export interface UserToken {
+  id: string;
+  user_id: string;
+  name: string;
+  created_at: string;
+  last_used_at?: string;
+  expires_at?: string;
+}
+
+export interface CreateTokenRequest {
+  name: string;
+  expires_in?: number; // days
+}
+
+export interface CreateTokenResponse {
+  id: string;
+  name: string;
+  token: string; // Only shown once
+  created_at: string;
+  expires_at?: string;
+}
+
+// Cluster ingress controller info
+export interface IngressControllerInfo {
+  available: boolean;
+  load_balancer?: string;
+  message?: string;
+  base_domain?: string; // e.g., "apps.shipit.unboundsec.dev"
 }

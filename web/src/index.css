@@ -1,5 +1,43 @@
 @import "tailwindcss";
 
+/* Railway-inspired dark mode color palette */
+@theme {
+  /* Background colors */
+  --color-background: #0a0a0a;
+  --color-surface: #141414;
+  --color-surface-hover: #1a1a1a;
+  --color-surface-active: #242424;
+  --color-border: #262626;
+  --color-border-subtle: #1f1f1f;
+
+  /* Text colors */
+  --color-text-primary: #fafafa;
+  --color-text-secondary: #a1a1a1;
+  --color-text-muted: #525252;
+
+  /* Accent (Unbound purple) */
+  --color-accent: #8B5CF6;
+  --color-accent-hover: #7C3AED;
+  --color-accent-muted: rgba(139, 92, 246, 0.15);
+
+  /* Status colors */
+  --color-success: #22c55e;
+  --color-success-muted: rgba(34, 197, 94, 0.15);
+  --color-warning: #eab308;
+  --color-warning-muted: rgba(234, 179, 8, 0.15);
+  --color-error: #ef4444;
+  --color-error-muted: rgba(239, 68, 68, 0.15);
+  --color-info: #3b82f6;
+  --color-info-muted: rgba(59, 130, 246, 0.15);
+
+  /* App card gradient colors */
+  --color-card-purple: rgba(168, 85, 247, 0.12);
+  --color-card-blue: rgba(59, 130, 246, 0.12);
+  --color-card-green: rgba(34, 197, 94, 0.12);
+  --color-card-orange: rgba(249, 115, 22, 0.12);
+  --color-card-pink: rgba(236, 72, 153, 0.12);
+}
+
 :root {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   line-height: 1.5;
@@ -11,9 +49,34 @@
 }
 
 body {
-  @apply m-0 min-h-screen bg-gray-50 text-gray-900;
+  @apply m-0 min-h-screen bg-background text-text-primary;
 }
 
 #root {
   @apply min-h-screen;
+}
+
+/* Scrollbar styling for dark mode */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Focus ring styling */
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }

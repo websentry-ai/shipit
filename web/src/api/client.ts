@@ -11,28 +11,50 @@ import type {
   HPAConfig,
   DomainStatus,
   DomainConfig,
+  PreDeployHookStatus,
+  PreDeployHookConfig,
+  User,
+  UserToken,
+  CreateTokenRequest,
+  CreateTokenResponse,
+  IngressControllerInfo,
 } from '../types';
 
 const API_BASE = '/api';
 
-// Get token from localStorage
+// Legacy token support (for backwards compatibility)
 function getToken(): string | null {
   return localStorage.getItem('shipit_token');
 }
 
-// Set token in localStorage
+// Set token in localStorage (legacy)
 export function setToken(token: string): void {
   localStorage.setItem('shipit_token', token);
 }
 
-// Clear token
+// Clear token (legacy)
 export function clearToken(): void {
   localStorage.removeItem('shipit_token');
 }
 
-// Check if authenticated
-export function isAuthenticated(): boolean {
-  return !!getToken();
+// Login - redirect to Google OAuth
+export function login(): void {
+  window.location.href = '/auth/login';
+}
+
+// Logout - clear session
+export async function logout(): Promise<void> {
+  try {
+    await fetch('/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+    });
+  } finally {
+    // Clear any legacy tokens
+    clearToken();
+    // Redirect to login
+    window.location.href = '/login';
+  }
 }
 
 async function request<T>(
@@ -49,6 +71,7 @@ async function request<T>(
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers,
+    credentials: 'include', // Include cookies for session auth
   });
 
   if (!response.ok) {
@@ -93,6 +116,10 @@ export async function getCluster(id: string): Promise<Cluster> {
 
 export async function deleteCluster(id: string): Promise<void> {
   return request(`/clusters/${id}`, { method: 'DELETE' });
+}
+
+export async function getClusterIngress(clusterId: string): Promise<IngressControllerInfo> {
+  return request<IngressControllerInfo>(`/clusters/${clusterId}/ingress`);
 }
 
 // Apps
@@ -162,6 +189,14 @@ export async function rollbackApp(
   });
 }
 
+// Deployment History
+export async function getDeploymentHistory(
+  appId: string,
+  limit = 20
+): Promise<AppRevision[]> {
+  return request<AppRevision[]>(`/apps/${appId}/deployments?limit=${limit}`);
+}
+
 // Secrets
 export async function listSecrets(appId: string): Promise<AppSecret[]> {
   return request<AppSecret[]>(`/apps/${appId}/secrets`);
@@ -223,5 +258,52 @@ export async function setDomain(
   return request<DomainStatus>(`/apps/${appId}/domain`, {
     method: 'PUT',
     body: JSON.stringify(config),
+  });
+}
+
+// Pre-deploy Hooks
+export async function getPreDeployHook(appId: string): Promise<PreDeployHookStatus> {
+  return request<PreDeployHookStatus>(`/apps/${appId}/predeploy`);
+}
+
+export async function setPreDeployHook(
+  appId: string,
+  config: PreDeployHookConfig
+): Promise<PreDeployHookStatus> {
+  return request<PreDeployHookStatus>(`/apps/${appId}/predeploy`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
+// User Profile
+export async function getMe(): Promise<User> {
+  return request<User>('/me');
+}
+
+// User Tokens
+export async function listTokens(): Promise<UserToken[]> {
+  return request<UserToken[]>('/tokens');
+}
+
+export async function createToken(data: CreateTokenRequest): Promise<CreateTokenResponse> {
+  return request<CreateTokenResponse>('/tokens', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteToken(tokenId: string): Promise<void> {
+  return request(`/tokens/${tokenId}`, { method: 'DELETE' });
+}
+
+// Porter migration - switch app management
+export async function switchAppManagement(
+  appId: string,
+  managedBy: 'shipit' | 'porter'
+): Promise<App> {
+  return request<App>(`/apps/${appId}/switchover`, {
+    method: 'PUT',
+    body: JSON.stringify({ managed_by: managedBy }),
   });
 }
