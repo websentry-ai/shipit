@@ -34,6 +34,8 @@ type App struct {
 	ID            string          `db:"id" json:"id"`
 	ClusterID     string          `db:"cluster_id" json:"cluster_id"`
 	Name          string          `db:"name" json:"name"`
+	ServiceName   *string         `db:"service_name" json:"service_name,omitempty"` // Service within Porter app (e.g., "gateway", "web")
+	AppGroup      *string         `db:"app_group" json:"app_group,omitempty"`       // Porter app name for grouping (e.g., "staging-gateway")
 	Namespace     string          `db:"namespace" json:"namespace"`
 	Image         string          `db:"image" json:"image"`
 	Replicas      int             `db:"replicas" json:"replicas"`
@@ -69,6 +71,14 @@ type App struct {
 	// Custom domain configuration
 	Domain       *string `db:"domain" json:"domain,omitempty"`
 	DomainStatus *string `db:"domain_status" json:"domain_status,omitempty"`
+
+	// Pre-deploy hook (command to run before deployment, e.g., migrations)
+	PreDeployCommand *string `db:"pre_deploy_command" json:"pre_deploy_command,omitempty"`
+
+	// Porter migration fields (Phase 3)
+	ManagedBy    string  `db:"managed_by" json:"managed_by"`                     // "shipit", "porter", or "observer"
+	PorterAppID  *string `db:"porter_app_id" json:"porter_app_id,omitempty"`     // Porter's internal app ID
+	PorterAppURL *string `db:"porter_app_url" json:"porter_app_url,omitempty"`   // Porter dashboard URL
 }
 
 // AppRevision stores a snapshot of app configuration at deploy time
@@ -100,6 +110,19 @@ type AppRevision struct {
 
 	// Domain snapshot
 	Domain *string `db:"domain" json:"domain,omitempty"`
+
+	// Pre-deploy hook snapshot
+	PreDeployCommand *string `db:"pre_deploy_command" json:"pre_deploy_command,omitempty"`
+
+	// Phase 3: Multi-service support snapshots
+	ServiceName *string `db:"service_name" json:"service_name,omitempty"`
+	AppGroup    *string `db:"app_group" json:"app_group,omitempty"`
+	ManagedBy   *string `db:"managed_by" json:"managed_by,omitempty"`
+
+	// Deployment status
+	DeployStatus  string     `db:"deploy_status" json:"deploy_status"`
+	DeployMessage *string    `db:"deploy_message" json:"deploy_message,omitempty"`
+	DeployedAt    *time.Time `db:"deployed_at" json:"deployed_at,omitempty"`
 }
 
 type AppSecret struct {
@@ -109,4 +132,37 @@ type AppSecret struct {
 	ValueEncrypted []byte    `db:"value_encrypted" json:"-"`
 	CreatedAt      time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`
+}
+
+// User represents an authenticated user (via Google SSO)
+type User struct {
+	ID          string     `db:"id" json:"id"`
+	Email       string     `db:"email" json:"email"`
+	Name        *string    `db:"name" json:"name,omitempty"`
+	PictureURL  *string    `db:"picture_url" json:"picture_url,omitempty"`
+	GoogleID    *string    `db:"google_id" json:"-"`
+	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
+	LastLoginAt *time.Time `db:"last_login_at" json:"last_login_at,omitempty"`
+}
+
+// Session represents a web session (cookie-based auth)
+type Session struct {
+	ID               string    `db:"id" json:"id"`
+	UserID           string    `db:"user_id" json:"user_id"`
+	SessionTokenHash string    `db:"session_token_hash" json:"-"`
+	ExpiresAt        time.Time `db:"expires_at" json:"expires_at"`
+	CreatedAt        time.Time `db:"created_at" json:"created_at"`
+	UserAgent        *string   `db:"user_agent" json:"user_agent,omitempty"`
+	IPAddress        *string   `db:"ip_address" json:"ip_address,omitempty"`
+}
+
+// UserToken represents a user-generated API token (for CLI)
+type UserToken struct {
+	ID         string     `db:"id" json:"id"`
+	UserID     string     `db:"user_id" json:"user_id"`
+	Name       string     `db:"name" json:"name"`
+	TokenHash  string     `db:"token_hash" json:"-"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
+	LastUsedAt *time.Time `db:"last_used_at" json:"last_used_at,omitempty"`
+	ExpiresAt  *time.Time `db:"expires_at" json:"expires_at,omitempty"`
 }

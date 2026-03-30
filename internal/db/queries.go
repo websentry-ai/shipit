@@ -87,6 +87,22 @@ func (db *DB) ListClusters(ctx context.Context, projectID string) ([]Cluster, er
 	return clusters, err
 }
 
+// ClusterWithKubeconfig includes the encrypted kubeconfig for Porter discovery
+type ClusterWithKubeconfig struct {
+	Cluster
+	KubeconfigEncrypted []byte `db:"kubeconfig_encrypted"`
+}
+
+// ListAllClustersWithKubeconfig lists all clusters with their kubeconfigs for Porter discovery
+func (db *DB) ListAllClustersWithKubeconfig(ctx context.Context) ([]ClusterWithKubeconfig, error) {
+	var clusters []ClusterWithKubeconfig
+	err := db.SelectContext(ctx, &clusters, `
+		SELECT id, project_id, name, endpoint, status, status_message, created_at, kubeconfig_encrypted
+		FROM clusters WHERE status = 'connected' ORDER BY created_at DESC
+	`)
+	return clusters, err
+}
+
 func (db *DB) GetCluster(ctx context.Context, id string) (*Cluster, error) {
 	var c Cluster
 	err := db.GetContext(ctx, &c, `SELECT * FROM clusters WHERE id = $1`, id)
@@ -253,6 +269,16 @@ func (db *DB) GetAppByDomain(ctx context.Context, domain string) (*App, error) {
 	return &a, err
 }
 
+// UpdateAppPreDeployCommand updates the pre-deploy command for an app
+func (db *DB) UpdateAppPreDeployCommand(ctx context.Context, id string, command *string) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		UPDATE apps SET pre_deploy_command = $1, updated_at = NOW()
+		WHERE id = $2 RETURNING *
+	`, command, id)
+	return &a, err
+}
+
 // Secret operations
 
 func (db *DB) ListSecrets(ctx context.Context, appID string) ([]AppSecret, error) {
@@ -324,6 +350,8 @@ type CreateRevisionParams struct {
 	MemoryTarget *int
 	// Domain
 	Domain *string
+	// Pre-deploy hook
+	PreDeployCommand *string
 }
 
 func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppRevision, error) {
@@ -332,13 +360,13 @@ func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppR
 		INSERT INTO app_revisions (app_id, revision_number, image, replicas, port, env_vars,
 			cpu_request, cpu_limit, memory_request, memory_limit,
 			health_path, health_port, health_initial_delay, health_period,
-			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain, pre_deploy_command)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		RETURNING *
 	`, p.AppID, p.RevisionNumber, p.Image, p.Replicas, p.Port, p.EnvVars,
 		p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit,
 		p.HealthPath, p.HealthPort, p.HealthDelay, p.HealthPeriod,
-		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain)
+		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain, p.PreDeployCommand)
 	return &r, err
 }
 
@@ -396,5 +424,286 @@ func (db *DB) DeleteOldRevisions(ctx context.Context, appID string, keepCount in
 			LIMIT $2
 		)
 	`, appID, keepCount)
+	return err
+}
+
+// UpdateRevisionStatus updates the deployment status of a revision
+func (db *DB) UpdateRevisionStatus(ctx context.Context, appID string, revisionNumber int, status string, message *string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE app_revisions SET deploy_status = $1, deploy_message = $2, deployed_at = NOW()
+		WHERE app_id = $3 AND revision_number = $4
+	`, status, message, appID, revisionNumber)
+	return err
+}
+
+// GetDeploymentHistory returns recent deployments for an app with status
+func (db *DB) GetDeploymentHistory(ctx context.Context, appID string, limit int) ([]AppRevision, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var revisions []AppRevision
+	err := db.SelectContext(ctx, &revisions, `
+		SELECT * FROM app_revisions
+		WHERE app_id = $1
+		ORDER BY revision_number DESC
+		LIMIT $2
+	`, appID, limit)
+	return revisions, err
+}
+
+// ============================================================================
+// User operations (Google SSO)
+// ============================================================================
+
+func (db *DB) GetUserByEmail(ctx context.Context, email string) (*User, error) {
+	var u User
+	err := db.GetContext(ctx, &u, `SELECT * FROM users WHERE email = $1`, email)
+	return &u, err
+}
+
+func (db *DB) GetUserByGoogleID(ctx context.Context, googleID string) (*User, error) {
+	var u User
+	err := db.GetContext(ctx, &u, `SELECT * FROM users WHERE google_id = $1`, googleID)
+	return &u, err
+}
+
+func (db *DB) GetUserByID(ctx context.Context, id string) (*User, error) {
+	var u User
+	err := db.GetContext(ctx, &u, `SELECT * FROM users WHERE id = $1`, id)
+	return &u, err
+}
+
+func (db *DB) CreateUser(ctx context.Context, email, name, pictureURL, googleID string) (*User, error) {
+	var u User
+	err := db.GetContext(ctx, &u, `
+		INSERT INTO users (email, name, picture_url, google_id)
+		VALUES ($1, $2, $3, $4)
+		RETURNING *
+	`, email, name, pictureURL, googleID)
+	return &u, err
+}
+
+func (db *DB) UpdateUserLastLogin(ctx context.Context, id string) error {
+	_, err := db.ExecContext(ctx, `UPDATE users SET last_login_at = NOW() WHERE id = $1`, id)
+	return err
+}
+
+func (db *DB) UpdateUserProfile(ctx context.Context, id, name, pictureURL string) error {
+	_, err := db.ExecContext(ctx, `UPDATE users SET name = $1, picture_url = $2 WHERE id = $3`, name, pictureURL, id)
+	return err
+}
+
+// ============================================================================
+// Session operations (web cookie auth)
+// ============================================================================
+
+func (db *DB) CreateSession(ctx context.Context, userID, tokenHash string, expiresAt time.Time, userAgent, ipAddress *string) (*Session, error) {
+	var s Session
+	err := db.GetContext(ctx, &s, `
+		INSERT INTO sessions (user_id, session_token_hash, expires_at, user_agent, ip_address)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING *
+	`, userID, tokenHash, expiresAt, userAgent, ipAddress)
+	return &s, err
+}
+
+func (db *DB) ValidateSession(ctx context.Context, tokenHash string) (*Session, error) {
+	var s Session
+	err := db.GetContext(ctx, &s, `
+		SELECT * FROM sessions
+		WHERE session_token_hash = $1 AND expires_at > NOW()
+	`, tokenHash)
+	return &s, err
+}
+
+func (db *DB) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM sessions WHERE session_token_hash = $1`, tokenHash)
+	return err
+}
+
+func (db *DB) DeleteUserSessions(ctx context.Context, userID string) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
+	return err
+}
+
+func (db *DB) DeleteExpiredSessions(ctx context.Context) (int64, error) {
+	result, err := db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < NOW()`)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+// ============================================================================
+// User Token operations (CLI auth)
+// ============================================================================
+
+func (db *DB) CreateUserToken(ctx context.Context, userID, name, tokenHash string, expiresAt *time.Time) (*UserToken, error) {
+	var t UserToken
+	err := db.GetContext(ctx, &t, `
+		INSERT INTO user_tokens (user_id, name, token_hash, expires_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING *
+	`, userID, name, tokenHash, expiresAt)
+	return &t, err
+}
+
+func (db *DB) ValidateUserToken(ctx context.Context, tokenHash string) (*UserToken, error) {
+	var t UserToken
+	err := db.GetContext(ctx, &t, `
+		SELECT * FROM user_tokens
+		WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > NOW())
+	`, tokenHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update last used timestamp in background
+	go db.Exec(`UPDATE user_tokens SET last_used_at = $1 WHERE id = $2`, time.Now(), t.ID)
+
+	return &t, nil
+}
+
+func (db *DB) ListUserTokens(ctx context.Context, userID string) ([]UserToken, error) {
+	var tokens []UserToken
+	err := db.SelectContext(ctx, &tokens, `
+		SELECT id, user_id, name, created_at, last_used_at, expires_at
+		FROM user_tokens WHERE user_id = $1 ORDER BY created_at DESC
+	`, userID)
+	return tokens, err
+}
+
+func (db *DB) DeleteUserToken(ctx context.Context, tokenID, userID string) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM user_tokens WHERE id = $1 AND user_id = $2`, tokenID, userID)
+	return err
+}
+
+func (db *DB) GetUserTokenByID(ctx context.Context, tokenID string) (*UserToken, error) {
+	var t UserToken
+	err := db.GetContext(ctx, &t, `SELECT * FROM user_tokens WHERE id = $1`, tokenID)
+	return &t, err
+}
+
+// ============================================================================
+// Porter Migration operations
+// ============================================================================
+
+// GetAppByPorterAppID finds an app by its Porter app ID
+func (db *DB) GetAppByPorterAppID(ctx context.Context, clusterID, porterAppID string) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		SELECT * FROM apps WHERE cluster_id = $1 AND porter_app_id = $2
+	`, clusterID, porterAppID)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// CreatePorterAppParams contains parameters for creating a Porter-discovered app
+type CreatePorterAppParams struct {
+	ClusterID    string
+	Name         string
+	ServiceName  string  // Service within the Porter app (e.g., "gateway", "web")
+	AppGroup     string  // Porter app name for grouping (e.g., "staging-gateway")
+	Namespace    string
+	Image        string
+	Replicas     int
+	Port         *int
+	EnvVars      []byte
+	CPURequest   string
+	CPULimit     string
+	MemRequest   string
+	MemLimit     string
+	ManagedBy    string  // "porter" or "shipit"
+	PorterAppID  string
+	PorterAppURL *string
+}
+
+func (db *DB) CreatePorterApp(ctx context.Context, p CreatePorterAppParams) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		INSERT INTO apps (cluster_id, name, service_name, app_group, namespace, image, replicas, port, env_vars, status,
+			cpu_request, cpu_limit, memory_request, memory_limit,
+			managed_by, porter_app_id, porter_app_url)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'running', $10, $11, $12, $13, $14, $15, $16)
+		RETURNING *
+	`, p.ClusterID, p.Name, p.ServiceName, p.AppGroup, p.Namespace, p.Image, p.Replicas, p.Port, p.EnvVars,
+		p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit,
+		p.ManagedBy, p.PorterAppID, p.PorterAppURL)
+	return &a, err
+}
+
+// UpdatePorterAppParams contains parameters for updating a Porter-discovered app
+type UpdatePorterAppParams struct {
+	ID         string
+	Image      string
+	Replicas   int
+	CPURequest string
+	CPULimit   string
+	MemRequest string
+	MemLimit   string
+}
+
+func (db *DB) UpdatePorterApp(ctx context.Context, p UpdatePorterAppParams) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		UPDATE apps SET
+			image = $1, replicas = $2,
+			cpu_request = $3, cpu_limit = $4,
+			memory_request = $5, memory_limit = $6,
+			updated_at = NOW()
+		WHERE id = $7 RETURNING *
+	`, p.Image, p.Replicas, p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit, p.ID)
+	return &a, err
+}
+
+// UpdateAppManagedBy updates the managed_by field for an app (for switchover)
+func (db *DB) UpdateAppManagedBy(ctx context.Context, id, managedBy string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE apps SET managed_by = $1, updated_at = NOW() WHERE id = $2
+	`, managedBy, id)
+	return err
+}
+
+// ListPorterApps lists all apps managed by Porter
+func (db *DB) ListPorterApps(ctx context.Context, clusterID string) ([]App, error) {
+	var apps []App
+	err := db.SelectContext(ctx, &apps, `
+		SELECT * FROM apps WHERE cluster_id = $1 AND managed_by = 'porter'
+		ORDER BY created_at DESC
+	`, clusterID)
+	return apps, err
+}
+
+// ListAllAppsWithManagedBy lists all apps including their managed_by status
+func (db *DB) ListAllAppsWithManagedBy(ctx context.Context) ([]App, error) {
+	var apps []App
+	err := db.SelectContext(ctx, &apps, `SELECT * FROM apps ORDER BY created_at DESC`)
+	return apps, err
+}
+
+// GetAppByClusterNamespaceName finds an app by cluster, namespace and name
+func (db *DB) GetAppByClusterNamespaceName(ctx context.Context, clusterID, namespace, name string) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		SELECT * FROM apps WHERE cluster_id = $1 AND namespace = $2 AND name = $3
+	`, clusterID, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// LinkAppToPorter updates an existing app with Porter info
+func (db *DB) LinkAppToPorter(ctx context.Context, appID, porterAppID string, porterAppURL *string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE apps SET
+			porter_app_id = $1,
+			porter_app_url = $2,
+			managed_by = 'porter',
+			updated_at = NOW()
+		WHERE id = $3
+	`, porterAppID, porterAppURL, appID)
 	return err
 }
