@@ -6,8 +6,8 @@ This document tracks planned features, development phases, implementation detail
 
 ## Current Status Summary
 
-**Version:** v0.7.0-custom-domains
-**Last Updated:** January 2026
+**Version:** v0.9.1
+**Last Updated:** January 4, 2026
 **Production URL:** https://shipit.unboundsec.dev
 
 | Phase | Status | Completion |
@@ -15,8 +15,15 @@ This document tracks planned features, development phases, implementation detail
 | Phase 1: Core Platform | ✅ Complete | 100% |
 | Phase 2: Production Readiness | ✅ Complete | 100% |
 | Phase 2.5: Custom Domains | ✅ Complete | 100% |
-| Phase 3: Developer Experience | 🟡 In Progress | 50% (Web Dashboard done) |
-| Phase 4: Enterprise Features | ⬜ Not Started | 0% |
+| Phase 2.6: Monitoring | ✅ Complete | 100% |
+| Phase 2.7: Pre-deploy Hooks | ✅ Complete | 100% |
+| Phase 2.8: Google SSO | ✅ Complete | 100% |
+| Phase 2.9: Default App URLs | ✅ Complete | 100% |
+| Phase 2.10: Design System & Dark Mode | 🟡 In Progress | 0% |
+| Phase 3: Porter Migration | 🟡 Planning | 0% |
+| Phase 4: Observability & Alerts | 🟡 Planning | 0% |
+| Phase 5: CI/CD Integration | 🟡 Planning | 0% |
+| Phase 6: Advanced Features | 🟡 Planning | 0% |
 
 ---
 
@@ -85,11 +92,172 @@ clusters (id, project_id, name, endpoint, kubeconfig_encrypted, status)
 apps (id, cluster_id, name, namespace, image, replicas, port, env_vars,
       cpu_request, cpu_limit, memory_request, memory_limit,
       health_path, health_port, health_initial_delay, health_period,
-      current_revision, status, created_at, updated_at)
-app_revisions (id, app_id, revision_number, image, replicas, ...)
+      current_revision, status, created_at, updated_at,
+      domain, domain_status, pre_deploy_command)
+app_revisions (id, app_id, revision_number, image, replicas, ...,
+      domain, pre_deploy_command)
 app_secrets (id, app_id, key, encrypted_value, created_at, updated_at)
 api_tokens (id, token_hash, name, created_at)
 ```
+
+---
+
+## Upcoming Phases (v1.0+)
+
+### Phase 3: Porter Migration & Coexistence
+
+**Goal**: Migrate existing Porter apps to shipit while running both systems in parallel
+
+#### 3.1 Migration Script & Observer Mode
+**Status**: Planning
+**Priority**: P0
+
+Import Porter apps and observe deployments before taking over.
+
+**Design Decisions**:
+
+| Decision | Choice |
+|----------|--------|
+| Source of truth | K8s primary, Porter for gaps (pre-deploy commands) |
+| App scope | All Porter apps (read-only sync is safe) |
+| Detection method | Porter labels/Helm naming pattern |
+| Observer behavior | Auto-update shipit DB when Porter deploys |
+| Architecture | Background worker in shipit (goroutine polling K8s) |
+| Switchover | Per-app toggle ("managed by shipit" flag) |
+| History import | No past history, track new deployments going forward |
+
+**Implementation Scope**:
+- [ ] Background worker to watch K8s deployments
+- [ ] Detect Porter-managed apps via labels
+- [ ] Import current state: image, replicas, resources, env vars from K8s
+- [ ] Fetch pre-deploy commands from Porter API
+- [ ] Auto-create shipit app records
+- [ ] Track deployment events (image changes)
+- [ ] Per-app "managed_by" field (porter/shipit)
+- [ ] UI toggle to switch management
+
+---
+
+### Phase 4: Observability & Alerts
+
+#### 4.1 Slack Notifications
+**Status**: Planning
+**Priority**: P1
+
+Send deployment notifications to Slack channels.
+
+**Design Decisions**:
+
+| Decision | Choice |
+|----------|--------|
+| Events to notify | Global default + per-app configurable override |
+| Channel | Single global channel (e.g., #deployments) |
+| Integration | Incoming Webhook (simple, no OAuth) |
+| Content | Standard: app name, image tag, deployed by, status, dashboard link |
+
+**Event Options** (configurable):
+- Deploy started
+- Pre-deploy hook running
+- Deploy success
+- Deploy failure
+- Rollback
+
+**Implementation Scope**:
+- [ ] Add `slack_webhook_url` to config/settings
+- [ ] Add `slack_events` global setting (bitmask or JSON array)
+- [ ] Add `slack_events` per-app override field
+- [ ] Slack notification service/function
+- [ ] Call on deploy events
+- [ ] Settings UI for Slack configuration
+
+---
+
+#### 4.2 Audit Logs
+**Status**: Planning
+**Priority**: P1
+
+Track deployment actions for compliance and debugging.
+
+**Design Decisions**:
+
+| Decision | Choice |
+|----------|--------|
+| Scope | Deployments only (deploy, rollback, config changes) |
+| Storage | PostgreSQL table |
+| Retention | 30 days (auto-cleanup) |
+| UI | Per-app "History" tab |
+
+**Logged Events**:
+- Deploy (image change)
+- Rollback
+- Env var changes
+- Secret changes
+- Scaling changes (replicas, HPA)
+- Pre-deploy hook config changes
+
+**Implementation Scope**:
+- [ ] Create `audit_logs` table (app_id, user_id, action, details, timestamp)
+- [ ] Add audit logging to deploy/rollback handlers
+- [ ] Add audit logging to config change handlers
+- [ ] Cleanup job for 30-day retention
+- [ ] GET /api/apps/{id}/history endpoint
+- [ ] History tab in app detail UI
+
+---
+
+### Phase 5: CI/CD Integration (Post-Switchover)
+
+#### 5.1 GitHub Actions Integration
+**Status**: Planning
+**Priority**: P2 (blocked on Porter switchover)
+
+Auto-deploy on push/merge via GitHub Actions.
+
+**Design Decisions**:
+
+| Decision | Choice |
+|----------|--------|
+| Trigger method | GitHub Action calls shipit deploy API |
+| Deploy events | Configurable per-app (branch, tag pattern, manual) |
+| Authentication | User API tokens (stored as GitHub secret) |
+| Tooling | Example workflow file (copy-paste, simplest) |
+
+**Implementation Scope**:
+- [ ] Document deploy API for CI/CD use
+- [ ] Create example GitHub Actions workflow file
+- [ ] Add per-app "auto_deploy" config (branch/tag pattern)
+- [ ] Optional: Webhook endpoint for GitHub push events
+- [ ] Example workflow in repo: `.github/workflows/deploy.yml.example`
+
+**Example Workflow**:
+```yaml
+name: Deploy to Shipit
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Shipit
+        run: |
+          curl -X POST "https://shipit.unboundsec.dev/api/apps/$APP_ID/deploy" \
+            -H "Authorization: Bearer ${{ secrets.SHIPIT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"image": "your-registry/app:${{ github.sha }}"}'
+```
+
+---
+
+### Phase 6: Advanced Features (Separate Planning)
+
+#### 6.1 Canary Deployments
+**Status**: Future
+**Priority**: P3
+
+Traffic splitting and gradual rollouts.
+
+**Design Decisions**: Requires dedicated planning session
 
 ---
 
@@ -130,9 +298,10 @@ api_tokens (id, token_hash, name, created_at)
 
 | Feature | Description | Status | Effort |
 |---------|-------------|--------|--------|
-| **User management** | User accounts with email/password authentication | Planned | Medium |
+| **User management** | User accounts with Google SSO authentication | ✅ Done | Medium |
+| **SSO/OAuth** | Google authentication with domain restriction | ✅ Done | Medium |
+| **User API tokens** | User-generated tokens for CLI authentication | ✅ Done | Medium |
 | **Team/roles** | Multi-user support with RBAC (viewer, developer, admin, owner) | Planned | Medium |
-| **SSO/OAuth** | GitHub, Google, GitLab authentication | Planned | Medium |
 | **Notifications** | Deployment alerts via Slack, email, webhooks | Planned | Small |
 | **Audit logs** | Track all user actions for compliance | Planned | Small |
 | **Add-ons marketplace** | Managed databases (PostgreSQL, Redis, etc.) | Planned | Large |
@@ -148,7 +317,7 @@ api_tokens (id, token_hash, name, created_at)
 | **API Server** | Stateless, middleware chain, auth | ✅ Chi router, middleware, JSON API | Minimal |
 | **CLI Client** | Cross-platform, config file | ✅ Cobra framework, full CRUD | Minimal |
 | **Web Dashboard** | React SPA | ✅ React + TypeScript + TanStack Query | Done |
-| **Authentication** | OAuth, API tokens, sessions | 🟡 API tokens only | Missing OAuth/sessions |
+| **Authentication** | OAuth, API tokens, sessions | ✅ Google OAuth + sessions + user tokens | Minimal |
 | **Authorization** | RBAC with policy engine | 🔴 None | Full RBAC needed |
 | **Provisioner Service** | Create clusters via IaC | 🟡 Connect existing only | No cluster creation |
 | **Background Workers** | Job queue with retry logic | 🔴 Synchronous only | No async processing |
@@ -161,9 +330,9 @@ api_tokens (id, token_hash, name, created_at)
 
 | Feature | Target | Current | Risk Level |
 |---------|--------|---------|------------|
-| Session management | HTTP-only cookies, CSRF | API tokens only | Low |
-| OAuth providers | GitHub, Google, GitLab | None | Medium |
-| Role-based access | Viewer/Developer/Admin/Owner | Single token = full access | **High** |
+| Session management | HTTP-only cookies, CSRF | ✅ HTTP-only cookies, secure sessions | Done |
+| OAuth providers | GitHub, Google, GitLab | ✅ Google OAuth with domain restriction | Done |
+| Role-based access | Viewer/Developer/Admin/Owner | Single user = full access | **High** |
 | Audit logging | All user actions logged | None | Medium |
 | Rate limiting | Per-user, per-endpoint | None | Low |
 
@@ -254,6 +423,50 @@ func (c *Client) DeleteIngress(name, namespace string) error
 - nginx-ingress controller installed in cluster
 - cert-manager with Let's Encrypt ClusterIssuer
 - DNS CNAME pointing to cluster ingress load balancer
+
+### Pre-deploy Hooks - ✅ COMPLETED
+
+**API Endpoints:**
+- `GET /apps/{id}/predeploy` - Get pre-deploy hook configuration
+- `PUT /apps/{id}/predeploy` - Set/update/remove pre-deploy command
+
+**Implementation:**
+1. Database migration (`008_pre_deploy_hooks.sql`):
+```sql
+ALTER TABLE apps ADD COLUMN pre_deploy_command TEXT;
+ALTER TABLE app_revisions ADD COLUMN pre_deploy_command TEXT;
+```
+
+2. K8s Job operations in `internal/k8s/client.go`:
+```go
+// RunPreDeployHook runs a pre-deploy command as a Kubernetes Job
+// Returns success/failure and captured logs
+func (c *Client) RunPreDeployHook(name, namespace, image, command string) (bool, string, error)
+```
+
+3. Deployment flow in `internal/api/handlers.go`:
+```go
+// DeployApp now checks for pre_deploy_command
+// If present, runs as K8s Job before deployment
+// Deployment fails if pre-deploy hook fails
+```
+
+4. Frontend Hooks tab with:
+   - Current hook status display
+   - Command configuration form
+   - Common examples (migrations, cache warm-up, asset compilation)
+   - Documentation and best practices
+
+**Use Cases:**
+- Database migrations: `python manage.py migrate`
+- Asset compilation: `npm run build`
+- Cache warming: `./scripts/warm-cache.sh`
+- Health pre-checks: `./scripts/pre-deploy-check.sh`
+
+**Porter Import Notes:**
+- `staging-celery` and `prod-celery` apps have pre-deploy: `bash ./migrate.sh`
+- Other apps have no pre-deploy hooks configured
+- Pre-deploy is a Porter abstraction stored in their DB, not in K8s directly
 
 ### Git-Based Deploy (Phase 3)
 
@@ -364,7 +577,7 @@ shipit_api_request_duration_seconds{method="...", path="..."}
 ### Later (Phase 3-4)
 10. **Git-based Deploy** - Webhooks, auto-build on push
 11. **RBAC** - Roles and permissions (HIGH PRIORITY for security)
-12. **OAuth/SSO** - GitHub, Google authentication
+12. ~~**OAuth/SSO**~~ - ✅ Google SSO complete (v0.9.0)
 13. **Notifications** - Slack, email alerts
 
 ---
@@ -374,6 +587,17 @@ shipit_api_request_duration_seconds{method="...", path="..."}
 ```
 # Public
 GET  /health
+
+# Authentication (v0.9.0)
+GET  /auth/login           # Redirect to Google OAuth
+GET  /auth/callback        # OAuth callback
+POST /auth/logout          # End session
+
+# User Profile & Tokens (v0.9.0)
+GET    /api/me             # Get current user
+GET    /api/tokens         # List user's API tokens
+POST   /api/tokens         # Create new API token
+DELETE /api/tokens/{id}    # Revoke API token
 
 # Projects
 GET    /api/projects
@@ -402,6 +626,8 @@ GET    /api/apps/{appID}/autoscaling
 PUT    /api/apps/{appID}/autoscaling
 GET    /api/apps/{appID}/domain
 PUT    /api/apps/{appID}/domain
+GET    /api/apps/{appID}/predeploy
+PUT    /api/apps/{appID}/predeploy
 
 # Revisions
 GET    /api/apps/{appID}/revisions
@@ -426,7 +652,7 @@ DELETE /api/apps/{appID}/secrets/{key}
 | Container Registry | AWS ECR | Docker image storage |
 | Infrastructure | AWS EKS | Managed Kubernetes |
 | Encryption | AES-256-GCM | Secrets and kubeconfig |
-| Auth | API Tokens (JWT planned) | Authentication |
+| Auth | Google OAuth + Sessions + User Tokens | Authentication |
 
 ---
 
@@ -650,5 +876,6 @@ When implementing features:
 | v0.5.0 | Jan 2026 | Web dashboard, environment variables |
 | v0.6.0 | Jan 2026 | HPA auto-scaling |
 | v0.7.0 | Jan 2026 | Custom domains & Ingress |
-| v0.8.0 | TBD | Pre-deploy hooks |
-| v0.9.0 | TBD | Google SSO |
+| v0.8.0 | Jan 2026 | Pre-deploy hooks |
+| v0.9.0 | Jan 2026 | Google SSO, user tokens, session auth |
+| v0.9.1 | Jan 2026 | Default app URLs with auto-TLS Ingress |
