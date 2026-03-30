@@ -345,6 +345,64 @@ Deployment manifests are in `deploy/k8s/`:
 | PORT | Server port (default: 8090) | No |
 | AWS_REGION | AWS region for EKS clusters | No |
 
+## Production Infrastructure
+
+### Hosting
+
+- **Application**: Deployed on AWS EKS cluster `unboundsecurity-cluster-nclpwi` in `us-west-2`
+- **Namespace**: `shipit`
+- **Database**: PostgreSQL on AWS RDS (not in-cluster)
+- **Container Registry**: ECR (`228304386839.dkr.ecr.us-west-2.amazonaws.com/shipit`)
+- **Web Dashboard**: [shipit.unboundsec.dev](https://shipit.unboundsec.dev)
+- **Auth**: Google SSO restricted to `@unboundsecurity.ai`
+
+### Accessing the Cluster
+
+```bash
+# Update kubeconfig for the EKS cluster
+aws eks update-kubeconfig --name unboundsecurity-cluster-nclpwi --region us-west-2
+
+# Verify access
+kubectl get pods -n shipit
+```
+
+### Running Database Migrations
+
+Migrations are not yet auto-applied on startup (see WEB-3881). To run manually:
+
+```bash
+# Spin up a temporary psql pod in the cluster
+kubectl run psql-migrate --rm -i --restart=Never -n shipit \
+  --image=postgres:16-alpine --quiet -- \
+  psql "$DATABASE_URL" -c "$(cat migrations/006_custom_domains.sql)"
+```
+
+The `DATABASE_URL` can be found in the `shipit-secrets` Kubernetes secret:
+
+```bash
+kubectl get secret shipit-secrets -n shipit -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+```
+
+### Deploying a New Version
+
+```bash
+# Build and push to ECR
+aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 228304386839.dkr.ecr.us-west-2.amazonaws.com
+docker build -t 228304386839.dkr.ecr.us-west-2.amazonaws.com/shipit:v<VERSION> .
+docker push 228304386839.dkr.ecr.us-west-2.amazonaws.com/shipit:v<VERSION>
+
+# Update the deployment image
+kubectl set image deployment/shipit shipit=228304386839.dkr.ecr.us-west-2.amazonaws.com/shipit:v<VERSION> -n shipit
+```
+
+### K8s Manifests
+
+Production manifests are in `deploy/k8s/`:
+
+- `shipit-production.yaml` — Full deployment (app + DB service + secrets + configmap)
+- `shipit-ingress.yaml` — Ingress with TLS for `shipit.unboundsec.dev`
+- `shipit.yaml` — Base deployment template
+
 ## Security
 
 - **Secrets encryption**: All app secrets are encrypted at rest using AES-256-GCM
