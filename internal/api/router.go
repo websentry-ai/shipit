@@ -7,13 +7,16 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/vigneshsubbiah/shipit/internal/auth"
+	"github.com/vigneshsubbiah/shipit/internal/config"
 	"github.com/vigneshsubbiah/shipit/internal/db"
+	"github.com/vigneshsubbiah/shipit/internal/porter"
 	"github.com/vigneshsubbiah/shipit/internal/web"
 )
 
-func NewRouter(database *db.DB, encryptKey string) http.Handler {
+func NewRouter(database *db.DB, cfg *config.Config, porterDiscovery *porter.DiscoveryService) http.Handler {
 	r := chi.NewRouter()
-	h := NewHandler(database, encryptKey)
+	h := NewHandler(database, cfg.EncryptKey, cfg.AppBaseDomain, porterDiscovery)
+	oauth := auth.NewOAuthHandler(cfg, database)
 
 	// Global middleware
 	r.Use(middleware.Logger)
@@ -22,6 +25,11 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 
 	// Public routes
 	r.Get("/health", h.Health)
+
+	// OAuth routes (public)
+	r.Get("/auth/login", oauth.HandleLogin)
+	r.Get("/auth/callback", oauth.HandleCallback)
+	r.Post("/auth/logout", oauth.HandleLogout)
 
 	// API routes with JSON content type
 	r.Group(func(r chi.Router) {
@@ -49,6 +57,7 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 		r.Route("/api/clusters/{clusterID}", func(r chi.Router) {
 			r.Get("/", h.GetCluster)
 			r.Delete("/", h.DeleteCluster)
+			r.Get("/ingress", h.GetClusterIngress)
 
 			// Apps under cluster
 			r.Route("/apps", func(r chi.Router) {
@@ -81,6 +90,9 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 				r.Get("/{revision}", h.GetRevision)
 			})
 
+			// Deployment history
+			r.Get("/deployments", h.GetDeploymentHistory)
+
 			// Autoscaling (HPA)
 			r.Get("/autoscaling", h.GetAutoscaling)
 			r.Put("/autoscaling", h.SetAutoscaling)
@@ -88,6 +100,21 @@ func NewRouter(database *db.DB, encryptKey string) http.Handler {
 			// Custom domains
 			r.Get("/domain", h.GetDomain)
 			r.Put("/domain", h.SetDomain)
+
+			// Pre-deploy hooks
+			r.Get("/predeploy", h.GetPreDeployHook)
+			r.Put("/predeploy", h.SetPreDeployHook)
+
+			// Porter migration - switchover
+			r.Put("/switchover", h.SwitchAppManagement)
+		})
+
+		// User profile and token management
+		r.Get("/api/me", h.GetMe)
+		r.Route("/api/tokens", func(r chi.Router) {
+			r.Get("/", h.ListMyTokens)
+			r.Post("/", h.CreateMyToken)
+			r.Delete("/{tokenID}", h.DeleteMyToken)
 		})
 	})
 

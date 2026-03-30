@@ -2,23 +2,35 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/vigneshsubbiah/shipit/internal/auth"
 	"github.com/vigneshsubbiah/shipit/internal/db"
 	"github.com/vigneshsubbiah/shipit/internal/k8s"
+	"github.com/vigneshsubbiah/shipit/internal/porter"
 )
 
 type Handler struct {
-	db         *db.DB
-	encryptKey string
+	db              *db.DB
+	encryptKey      string
+	appBaseDomain   string // e.g., "apps.shipit.unboundsec.dev"
+	porterDiscovery *porter.DiscoveryService
 }
 
-func NewHandler(database *db.DB, encryptKey string) *Handler {
-	return &Handler{db: database, encryptKey: encryptKey}
+func NewHandler(database *db.DB, encryptKey, appBaseDomain string, porterDiscovery *porter.DiscoveryService) *Handler {
+	return &Handler{
+		db:              database,
+		encryptKey:      encryptKey,
+		appBaseDomain:   appBaseDomain,
+		porterDiscovery: porterDiscovery,
+	}
 }
 
 // Health check
@@ -181,6 +193,13 @@ func (h *Handler) testClusterConnection(clusterID string, kubeconfig []byte) {
 	}
 
 	h.db.UpdateClusterStatus(ctx, clusterID, "connected", nil, info.Endpoint)
+
+	// Register cluster with Porter discovery service and trigger initial sync
+	if h.porterDiscovery != nil {
+		h.porterDiscovery.RegisterCluster(clusterID, kubeconfig)
+		// Trigger immediate sync for this cluster
+		go h.porterDiscovery.SyncCluster(ctx, clusterID, kubeconfig)
+	}
 }
 
 func (h *Handler) GetCluster(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +214,12 @@ func (h *Handler) GetCluster(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) DeleteCluster(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "clusterID")
+
+	// Unregister from Porter discovery before deleting
+	if h.porterDiscovery != nil {
+		h.porterDiscovery.UnregisterCluster(id)
+	}
+
 	if err := h.db.DeleteCluster(r.Context(), id); err != nil {
 		httpError(w, "failed to delete cluster", http.StatusInternalServerError)
 		return
@@ -472,6 +497,8 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		MemoryTarget: app.MemoryTarget,
 		// Domain snapshot
 		Domain: app.Domain,
+		// Pre-deploy hook snapshot
+		PreDeployCommand: app.PreDeployCommand,
 	})
 	if err != nil {
 		msg := "failed to create revision: " + err.Error()
@@ -507,6 +534,32 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		}
 	}
 
+	// Run pre-deploy hook if configured
+	if app.PreDeployCommand != nil && *app.PreDeployCommand != "" {
+		h.db.UpdateAppStatus(ctx, appID, "running_predeploy", nil)
+
+		result, err := client.RunPreDeployJob(ctx, k8s.PreDeployJobRequest{
+			AppName:    app.Name,
+			Namespace:  app.Namespace,
+			Image:      app.Image,
+			Command:    *app.PreDeployCommand,
+			EnvVars:    envVars,
+			SecretName: secretName,
+		})
+		if err != nil {
+			msg := "failed to run pre-deploy hook: " + err.Error()
+			h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+			h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+			return
+		}
+		if !result.Success {
+			msg := "pre-deploy hook failed: " + result.Error + "\nLogs:\n" + result.Logs
+			h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+			h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+			return
+		}
+	}
+
 	err = client.DeployApp(k8s.DeployRequest{
 		Name:       app.Name,
 		Namespace:  app.Namespace,
@@ -525,16 +578,22 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		HealthPort:         app.HealthPort,
 		HealthInitialDelay: app.HealthInitialDelay,
 		HealthPeriod:       app.HealthPeriod,
+		// Default app URL
+		BaseDomain: h.appBaseDomain,
 	})
 	if err != nil {
 		msg := err.Error()
 		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		// Mark revision as failed
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
 		return
 	}
 
 	// Update app's current revision and status
 	h.db.UpdateAppRevision(ctx, appID, newRevision)
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
+	// Mark revision as successful
+	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "success", nil)
 
 	// Sync Ingress if domain is configured
 	if app.Domain != nil && *app.Domain != "" {
@@ -815,6 +874,33 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 		"target_revision":   targetRevision.RevisionNumber,
 		"target_image":      targetRevision.Image,
 	})
+}
+
+// Deployment History
+
+func (h *Handler) GetDeploymentHistory(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	// Verify app exists
+	if _, err := h.db.GetApp(r.Context(), appID); err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	// Get limit from query params, default 20
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	history, err := h.db.GetDeploymentHistory(r.Context(), appID, limit)
+	if err != nil {
+		httpError(w, "failed to get deployment history", http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(history)
 }
 
 // Autoscaling (HPA)
@@ -1107,7 +1193,284 @@ func (h *Handler) SetDomain(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// Pre-deploy Hooks
+
+func (h *Handler) GetPreDeployHook(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"pre_deploy_command": app.PreDeployCommand,
+	})
+}
+
+func (h *Handler) SetPreDeployHook(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	// Verify app exists
+	if _, err := h.db.GetApp(r.Context(), appID); err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	var req struct {
+		Command *string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Update the pre-deploy command
+	app, err := h.db.UpdateAppPreDeployCommand(r.Context(), appID, req.Command)
+	if err != nil {
+		httpError(w, "failed to update pre-deploy hook", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"pre_deploy_command": app.PreDeployCommand,
+	})
+}
+
+// ============================================================================
+// User & Token Management (SSO)
+// ============================================================================
+
+// GetMe returns the current authenticated user
+func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r.Context())
+	if user == nil {
+		httpError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	json.NewEncoder(w).Encode(user)
+}
+
+// ListMyTokens returns the current user's API tokens
+func (h *Handler) ListMyTokens(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r.Context())
+	if user == nil {
+		httpError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	tokens, err := h.db.ListUserTokens(r.Context(), user.ID)
+	if err != nil {
+		httpError(w, "failed to list tokens", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(tokens)
+}
+
+// CreateMyToken creates a new API token for the current user
+func (h *Handler) CreateMyToken(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r.Context())
+	if user == nil {
+		httpError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Name      string `json:"name"`
+		ExpiresIn *int   `json:"expires_in"` // days, optional
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Name == "" {
+		httpError(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate raw token (show to user once)
+	rawToken, err := generateSecureToken()
+	if err != nil {
+		httpError(w, "failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	// Hash for storage
+	tokenHash := hashToken(rawToken)
+
+	// Calculate expiration
+	var expiresAt *string
+	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
+		t := strconv.FormatInt(int64(*req.ExpiresIn), 10)
+		expiresAt = &t
+	}
+
+	var expTime *time.Time
+	if expiresAt != nil {
+		days, _ := strconv.Atoi(*expiresAt)
+		t := time.Now().Add(time.Duration(days) * 24 * time.Hour)
+		expTime = &t
+	}
+
+	token, err := h.db.CreateUserToken(r.Context(), user.ID, req.Name, tokenHash, expTime)
+	if err != nil {
+		httpError(w, "failed to create token", http.StatusInternalServerError)
+		return
+	}
+
+	// Return token with raw value (only shown once)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":          token.ID,
+		"name":        token.Name,
+		"token":       rawToken, // Only shown once
+		"created_at":  token.CreatedAt,
+		"expires_at":  token.ExpiresAt,
+	})
+}
+
+// DeleteMyToken revokes a user's API token
+func (h *Handler) DeleteMyToken(w http.ResponseWriter, r *http.Request) {
+	user := auth.GetUser(r.Context())
+	if user == nil {
+		httpError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	tokenID := chi.URLParam(r, "tokenID")
+	if tokenID == "" {
+		httpError(w, "token ID is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.db.DeleteUserToken(r.Context(), tokenID, user.ID); err != nil {
+		httpError(w, "failed to delete token", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func httpError(w http.ResponseWriter, message string, code int) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// generateSecureToken generates a cryptographically secure token
+func generateSecureToken() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// hashToken hashes a token using SHA-256
+func hashToken(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
+}
+
+// GetClusterIngress returns information about the cluster's ingress controller
+func (h *Handler) GetClusterIngress(w http.ResponseWriter, r *http.Request) {
+	clusterID := chi.URLParam(r, "clusterID")
+
+	cluster, err := h.db.GetCluster(r.Context(), clusterID)
+	if err != nil {
+		httpError(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, h.encryptKey)
+	if err != nil {
+		httpError(w, "failed to decrypt kubeconfig", http.StatusInternalServerError)
+		return
+	}
+
+	client, err := k8s.NewClient(kubeconfig)
+	if err != nil {
+		httpError(w, "failed to connect to cluster", http.StatusInternalServerError)
+		return
+	}
+
+	info, err := client.GetIngressController()
+	if err != nil {
+		httpError(w, "failed to get ingress controller: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Include the base domain in the response
+	response := struct {
+		Available    bool   `json:"available"`
+		LoadBalancer string `json:"load_balancer,omitempty"`
+		Message      string `json:"message,omitempty"`
+		BaseDomain   string `json:"base_domain,omitempty"`
+	}{
+		Available:    info.Available,
+		LoadBalancer: info.LoadBalancer,
+		Message:      info.Message,
+		BaseDomain:   h.appBaseDomain,
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+// SwitchAppManagement switches an app between Porter and Shipit management
+func (h *Handler) SwitchAppManagement(w http.ResponseWriter, r *http.Request) {
+	appID := chi.URLParam(r, "appID")
+
+	var req struct {
+		ManagedBy string `json:"managed_by"` // "shipit" or "porter"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.ManagedBy != "shipit" && req.ManagedBy != "porter" {
+		httpError(w, "managed_by must be 'shipit' or 'porter'", http.StatusBadRequest)
+		return
+	}
+
+	// Get current app state
+	app, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		httpError(w, "app not found", http.StatusNotFound)
+		return
+	}
+
+	// Can only switch Porter-discovered apps (they have a porter_app_id)
+	if app.PorterAppID == nil || *app.PorterAppID == "" {
+		httpError(w, "this app was not discovered from Porter", http.StatusBadRequest)
+		return
+	}
+
+	// Perform the switch
+	if h.porterDiscovery != nil {
+		if req.ManagedBy == "shipit" {
+			if err := h.porterDiscovery.SwitchToShipit(r.Context(), appID); err != nil {
+				httpError(w, "failed to switch to shipit: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			if err := h.porterDiscovery.SwitchToPorter(r.Context(), appID); err != nil {
+				httpError(w, "failed to switch to porter: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+	} else {
+		// Fallback if porter discovery service not available
+		if err := h.db.UpdateAppManagedBy(r.Context(), appID, req.ManagedBy); err != nil {
+			httpError(w, "failed to update app: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Return updated app
+	app, _ = h.db.GetApp(r.Context(), appID)
+	json.NewEncoder(w).Encode(app)
 }

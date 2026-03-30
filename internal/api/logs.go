@@ -103,7 +103,8 @@ func (h *Handler) GetAppStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, err := client.GetDeploymentStatus(app.Name, app.Namespace)
+	// Use enhanced status that includes CPU/memory metrics from metrics-server
+	status, err := client.GetEnhancedDeploymentStatus(app.Name, app.Namespace)
 	if err != nil {
 		httpError(w, "failed to get status: "+err.Error(), http.StatusInternalServerError)
 		return
