@@ -1,14 +1,18 @@
 package k8s
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -48,6 +52,9 @@ type DeployRequest struct {
 	HealthPort         *int
 	HealthInitialDelay *int // seconds
 	HealthPeriod       *int // seconds
+
+	// Default ingress hostname (auto-generated URL)
+	BaseDomain string // e.g., "apps.shipit.unboundsec.dev" - if set, creates ingress at <name>.apps.shipit.unboundsec.dev
 }
 
 type DeploymentStatus struct {
@@ -65,6 +72,18 @@ type PodStatus struct {
 	Ready    bool   `json:"ready"`
 	Restarts int32  `json:"restarts"`
 	Age      string `json:"age"`
+	// Resource metrics (from metrics-server)
+	CPUUsage    string `json:"cpu_usage,omitempty"`    // e.g., "50m" (millicores)
+	MemoryUsage string `json:"memory_usage,omitempty"` // e.g., "128Mi"
+	CPUPercent  *int   `json:"cpu_percent,omitempty"`  // percentage of limit
+	MemPercent  *int   `json:"mem_percent,omitempty"`  // percentage of limit
+}
+
+// PodMetrics represents resource usage for a pod
+type PodMetrics struct {
+	Name        string `json:"name"`
+	CPUUsage    string `json:"cpu_usage"`    // e.g., "50m"
+	MemoryUsage string `json:"memory_usage"` // e.g., "128Mi"
 }
 
 // HPAConfig represents Horizontal Pod Autoscaler configuration
@@ -271,6 +290,13 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		}
 	}
 
+	// Create ingress for default URL if base domain is specified
+	if req.BaseDomain != "" && req.Port != nil {
+		if err := c.ensureIngress(req); err != nil {
+			return fmt.Errorf("failed to create ingress: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -343,6 +369,72 @@ func (c *Client) ensureService(req DeployRequest) error {
 	return err
 }
 
+// ensureIngress creates or updates an Ingress for the app with automatic TLS
+func (c *Client) ensureIngress(req DeployRequest) error {
+	if req.BaseDomain == "" || req.Port == nil {
+		return nil // No base domain or port, skip ingress
+	}
+
+	ctx := context.Background()
+	ingressClient := c.clientset.NetworkingV1().Ingresses(req.Namespace)
+
+	// Construct hostname: <app-name>.<base-domain>
+	hostname := req.Name + "." + req.BaseDomain
+	pathType := networkingv1.PathTypePrefix
+
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.Name,
+			Namespace: req.Namespace,
+			Labels:    map[string]string{"app": req.Name, "managed-by": "shipit"},
+			Annotations: map[string]string{
+				"cert-manager.io/cluster-issuer":           "letsencrypt-prod",
+				"nginx.ingress.kubernetes.io/ssl-redirect": "true",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: stringPtr("nginx"),
+			TLS: []networkingv1.IngressTLS{{
+				Hosts:      []string{hostname},
+				SecretName: req.Name + "-tls",
+			}},
+			Rules: []networkingv1.IngressRule{{
+				Host: hostname,
+				IngressRuleValue: networkingv1.IngressRuleValue{
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{{
+							Path:     "/",
+							PathType: &pathType,
+							Backend: networkingv1.IngressBackend{
+								Service: &networkingv1.IngressServiceBackend{
+									Name: req.Name,
+									Port: networkingv1.ServiceBackendPort{
+										Number: int32(*req.Port),
+									},
+								},
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
+
+	existing, err := ingressClient.Get(ctx, req.Name, metav1.GetOptions{})
+	if err != nil {
+		_, err = ingressClient.Create(ctx, ingress, metav1.CreateOptions{})
+		return err
+	}
+
+	ingress.ResourceVersion = existing.ResourceVersion
+	_, err = ingressClient.Update(ctx, ingress, metav1.UpdateOptions{})
+	return err
+}
+
+func stringPtr(s string) *string {
+	return &s
+}
+
 func (c *Client) DeleteApp(name, namespace string) error {
 	ctx := context.Background()
 
@@ -351,6 +443,9 @@ func (c *Client) DeleteApp(name, namespace string) error {
 
 	// Delete service
 	c.clientset.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+
+	// Delete ingress (if exists)
+	c.clientset.NetworkingV1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 
 	// Delete secret (if exists)
 	c.clientset.CoreV1().Secrets(namespace).Delete(ctx, name+"-secrets", metav1.DeleteOptions{})
@@ -790,4 +885,584 @@ func (c *Client) DeleteIngress(name, namespace string) error {
 		return fmt.Errorf("failed to delete Ingress: %w", err)
 	}
 	return nil
+}
+
+// GetPodMetrics fetches CPU and memory usage for pods from metrics-server
+func (c *Client) GetPodMetrics(namespace string, labelSelector string) (map[string]PodMetrics, error) {
+	ctx := context.Background()
+
+	// Use the REST client to query metrics.k8s.io API
+	result := c.clientset.RESTClient().Get().
+		AbsPath("/apis/metrics.k8s.io/v1beta1").
+		Resource("pods").
+		Namespace(namespace).
+		Param("labelSelector", labelSelector).
+		Do(ctx)
+
+	if err := result.Error(); err != nil {
+		return nil, fmt.Errorf("failed to get pod metrics: %w", err)
+	}
+
+	raw, err := result.Raw()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metrics response: %w", err)
+	}
+
+	// Parse the metrics response
+	var metricsResponse struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Containers []struct {
+				Name  string `json:"name"`
+				Usage struct {
+					CPU    string `json:"cpu"`
+					Memory string `json:"memory"`
+				} `json:"usage"`
+			} `json:"containers"`
+		} `json:"items"`
+	}
+
+	if err := json.Unmarshal(raw, &metricsResponse); err != nil {
+		return nil, fmt.Errorf("failed to parse metrics response: %w", err)
+	}
+
+	metrics := make(map[string]PodMetrics)
+	for _, item := range metricsResponse.Items {
+		// Aggregate container metrics for the pod
+		var totalCPU, totalMem int64
+		for _, container := range item.Containers {
+			// Parse CPU (e.g., "50m" or "100000000n")
+			cpuQty, err := resource.ParseQuantity(container.Usage.CPU)
+			if err == nil {
+				totalCPU += cpuQty.MilliValue()
+			}
+			// Parse memory (e.g., "128Mi")
+			memQty, err := resource.ParseQuantity(container.Usage.Memory)
+			if err == nil {
+				totalMem += memQty.Value()
+			}
+		}
+
+		metrics[item.Metadata.Name] = PodMetrics{
+			Name:        item.Metadata.Name,
+			CPUUsage:    fmt.Sprintf("%dm", totalCPU),
+			MemoryUsage: formatBytes(totalMem),
+		}
+	}
+
+	return metrics, nil
+}
+
+// formatBytes converts bytes to human readable format
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%dB", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ci", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// GetEnhancedDeploymentStatus returns deployment status with pod metrics
+func (c *Client) GetEnhancedDeploymentStatus(name, namespace string) (*DeploymentStatus, error) {
+	ctx := context.Background()
+
+	deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	status := "unknown"
+	if deployment.Status.ReadyReplicas == *deployment.Spec.Replicas {
+		status = "running"
+	} else if deployment.Status.ReadyReplicas > 0 {
+		status = "partial"
+	} else {
+		status = "pending"
+	}
+
+	// Get pods for this deployment
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", name),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	// Try to get pod metrics (may fail if metrics-server not available)
+	podMetrics, _ := c.GetPodMetrics(namespace, fmt.Sprintf("app=%s", name))
+
+	var podStatuses []PodStatus
+	for _, pod := range pods.Items {
+		// Calculate age
+		age := time.Since(pod.CreationTimestamp.Time)
+		ageStr := formatDuration(age)
+
+		// Check if pod is ready
+		ready := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+
+		// Get restart count and resource limits from container statuses
+		var restarts int32
+		var cpuLimit, memLimit int64
+		for _, cs := range pod.Status.ContainerStatuses {
+			restarts += cs.RestartCount
+		}
+		// Get limits from spec
+		for _, container := range pod.Spec.Containers {
+			if container.Resources.Limits != nil {
+				if cpu, ok := container.Resources.Limits[corev1.ResourceCPU]; ok {
+					cpuLimit += cpu.MilliValue()
+				}
+				if mem, ok := container.Resources.Limits[corev1.ResourceMemory]; ok {
+					memLimit += mem.Value()
+				}
+			}
+		}
+
+		podStatus := PodStatus{
+			Name:     pod.Name,
+			Phase:    string(pod.Status.Phase),
+			Ready:    ready,
+			Restarts: restarts,
+			Age:      ageStr,
+		}
+
+		// Add metrics if available
+		if metrics, ok := podMetrics[pod.Name]; ok {
+			podStatus.CPUUsage = metrics.CPUUsage
+			podStatus.MemoryUsage = metrics.MemoryUsage
+
+			// Calculate percentages if limits are set
+			if cpuLimit > 0 {
+				// Parse the CPU usage to get millicores
+				cpuUsageStr := metrics.CPUUsage
+				if len(cpuUsageStr) > 1 && cpuUsageStr[len(cpuUsageStr)-1] == 'm' {
+					if cpuUsage, err := strconv.ParseInt(cpuUsageStr[:len(cpuUsageStr)-1], 10, 64); err == nil {
+						pct := int((cpuUsage * 100) / cpuLimit)
+						podStatus.CPUPercent = &pct
+					}
+				}
+			}
+			if memLimit > 0 {
+				// Parse the memory usage
+				memQty, err := resource.ParseQuantity(metrics.MemoryUsage)
+				if err == nil {
+					pct := int((memQty.Value() * 100) / memLimit)
+					podStatus.MemPercent = &pct
+				}
+			}
+		}
+
+		podStatuses = append(podStatuses, podStatus)
+	}
+
+	return &DeploymentStatus{
+		Name:            name,
+		Replicas:        *deployment.Spec.Replicas,
+		ReadyReplicas:   deployment.Status.ReadyReplicas,
+		DesiredReplicas: *deployment.Spec.Replicas,
+		Status:          status,
+		Pods:            podStatuses,
+	}, nil
+}
+
+// PreDeployJobRequest contains parameters for running a pre-deploy job
+type PreDeployJobRequest struct {
+	AppName    string
+	Namespace  string
+	Image      string
+	Command    string
+	EnvVars    map[string]string
+	SecretName string // Optional: K8s Secret name to inject as env vars
+	Timeout    time.Duration
+}
+
+// PreDeployJobResult contains the result of a pre-deploy job
+type PreDeployJobResult struct {
+	Success bool
+	Logs    string
+	Error   string
+}
+
+// RunPreDeployJob creates and runs a Kubernetes Job for pre-deploy commands
+// It waits for completion and returns the result with logs
+func (c *Client) RunPreDeployJob(ctx context.Context, req PreDeployJobRequest) (*PreDeployJobResult, error) {
+	if req.Timeout == 0 {
+		req.Timeout = 5 * time.Minute
+	}
+
+	jobName := fmt.Sprintf("%s-predeploy-%d", req.AppName, time.Now().Unix())
+
+	// Build env vars
+	var envVars []corev1.EnvVar
+	for k, v := range req.EnvVars {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+	}
+
+	// Build container
+	container := corev1.Container{
+		Name:    "predeploy",
+		Image:   req.Image,
+		Command: []string{"/bin/sh", "-c"},
+		Args:    []string{req.Command},
+		Env:     envVars,
+	}
+
+	// Inject secrets if specified
+	if req.SecretName != "" {
+		container.EnvFrom = []corev1.EnvFromSource{{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: req.SecretName,
+				},
+			},
+		}}
+	}
+
+	// Job configuration
+	backoffLimit := int32(0)  // No retries
+	ttlSeconds := int32(300)  // Auto-delete after 5 minutes
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: req.Namespace,
+			Labels: map[string]string{
+				"app":        req.AppName,
+				"managed-by": "shipit",
+				"job-type":   "predeploy",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &ttlSeconds,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app":      req.AppName,
+						"job-name": jobName,
+					},
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{container},
+				},
+			},
+		},
+	}
+
+	// Create the job
+	jobsClient := c.clientset.BatchV1().Jobs(req.Namespace)
+	_, err := jobsClient.Create(ctx, job, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pre-deploy job: %w", err)
+	}
+
+	// Wait for job completion with timeout
+	timeoutCtx, cancel := context.WithTimeout(ctx, req.Timeout)
+	defer cancel()
+
+	result := &PreDeployJobResult{}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			// Cleanup job on timeout
+			_ = jobsClient.Delete(ctx, jobName, metav1.DeleteOptions{})
+			result.Success = false
+			result.Error = "pre-deploy job timed out"
+			result.Logs = c.getJobLogs(ctx, req.Namespace, jobName)
+			return result, nil
+
+		case <-ticker.C:
+			// Check job status
+			currentJob, err := jobsClient.Get(ctx, jobName, metav1.GetOptions{})
+			if err != nil {
+				continue
+			}
+
+			// Check if completed
+			if currentJob.Status.Succeeded > 0 {
+				result.Success = true
+				result.Logs = c.getJobLogs(ctx, req.Namespace, jobName)
+				return result, nil
+			}
+
+			// Check if failed
+			if currentJob.Status.Failed > 0 {
+				result.Success = false
+				result.Error = "pre-deploy job failed"
+				result.Logs = c.getJobLogs(ctx, req.Namespace, jobName)
+				return result, nil
+			}
+		}
+	}
+}
+
+// getJobLogs retrieves logs from a job's pod
+func (c *Client) getJobLogs(ctx context.Context, namespace, jobName string) string {
+	// Find the pod created by the job
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("job-name=%s", jobName),
+	})
+	if err != nil || len(pods.Items) == 0 {
+		return ""
+	}
+
+	podName := pods.Items[0].Name
+
+	// Get logs from the pod
+	opts := &corev1.PodLogOptions{
+		Container: "predeploy",
+	}
+
+	req := c.clientset.CoreV1().Pods(namespace).GetLogs(podName, opts)
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return ""
+	}
+	defer stream.Close()
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, stream)
+	return buf.String()
+}
+
+// IngressControllerInfo contains information about the cluster's ingress controller
+type IngressControllerInfo struct {
+	Available    bool   `json:"available"`
+	LoadBalancer string `json:"load_balancer,omitempty"`
+	Message      string `json:"message,omitempty"`
+}
+
+// GetIngressController finds the ingress controller service and returns its load balancer endpoint
+// It searches in common namespaces: ingress-nginx, nginx-ingress, ingress
+func (c *Client) GetIngressController() (*IngressControllerInfo, error) {
+	ctx := context.Background()
+
+	// Common namespaces and service name patterns for ingress controllers
+	searchPatterns := []struct {
+		namespace string
+		labelSelector string
+	}{
+		{"ingress-nginx", "app.kubernetes.io/component=controller"},
+		{"ingress-nginx", "app=ingress-nginx"},
+		{"nginx-ingress", "app=nginx-ingress"},
+		{"ingress", "app=nginx-ingress"},
+		{"kube-system", "app=nginx-ingress"},
+	}
+
+	for _, pattern := range searchPatterns {
+		services, err := c.clientset.CoreV1().Services(pattern.namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: pattern.labelSelector,
+		})
+		if err != nil {
+			continue // Namespace might not exist
+		}
+
+		for _, svc := range services.Items {
+			if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
+				if len(svc.Status.LoadBalancer.Ingress) > 0 {
+					lb := svc.Status.LoadBalancer.Ingress[0]
+					loadBalancer := lb.Hostname
+					if loadBalancer == "" {
+						loadBalancer = lb.IP
+					}
+					if loadBalancer != "" {
+						return &IngressControllerInfo{
+							Available:    true,
+							LoadBalancer: loadBalancer,
+						}, nil
+					}
+				}
+				// Service exists but no load balancer assigned yet
+				return &IngressControllerInfo{
+					Available: true,
+					Message:   "Ingress controller found but load balancer is still provisioning",
+				}, nil
+			}
+		}
+	}
+
+	// Try to find any service with nginx-ingress or ingress-controller in the name
+	allNamespaces, err := c.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err == nil {
+		for _, ns := range allNamespaces.Items {
+			services, err := c.clientset.CoreV1().Services(ns.Name).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				continue
+			}
+			for _, svc := range services.Items {
+				if svc.Spec.Type == corev1.ServiceTypeLoadBalancer &&
+					(strings.Contains(svc.Name, "ingress") || strings.Contains(svc.Name, "nginx")) {
+					if len(svc.Status.LoadBalancer.Ingress) > 0 {
+						lb := svc.Status.LoadBalancer.Ingress[0]
+						loadBalancer := lb.Hostname
+						if loadBalancer == "" {
+							loadBalancer = lb.IP
+						}
+						if loadBalancer != "" {
+							return &IngressControllerInfo{
+								Available:    true,
+								LoadBalancer: loadBalancer,
+							}, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return &IngressControllerInfo{
+		Available: false,
+		Message:   "No ingress controller found. Install nginx-ingress to enable custom domains.",
+	}, nil
+}
+
+// PorterApp represents a discovered Porter application with its services
+type PorterApp struct {
+	AppName  string          `json:"app_name"`
+	Services []PorterService `json:"services"`
+}
+
+// PorterService represents a single service within a Porter app
+type PorterService struct {
+	ServiceName      string            `json:"service_name"`
+	ServiceType      string            `json:"service_type"` // web, worker, job
+	DeploymentName   string            `json:"deployment_name"`
+	Namespace        string            `json:"namespace"`
+	Image            string            `json:"image"`
+	Replicas         int32             `json:"replicas"`
+	Port             *int              `json:"port,omitempty"`
+	EnvVars          map[string]string `json:"env_vars"`
+	CPURequest       string            `json:"cpu_request"`
+	CPULimit         string            `json:"cpu_limit"`
+	MemoryRequest    string            `json:"memory_request"`
+	MemoryLimit      string            `json:"memory_limit"`
+	HealthPath       string            `json:"health_path,omitempty"`
+	PreDeployCommand string            `json:"pre_deploy_command,omitempty"`
+	Domain           string            `json:"domain,omitempty"`
+	AppID            string            `json:"app_id"`            // Porter app ID
+	AppInstanceID    string            `json:"app_instance_id"`  // Porter app instance ID
+	RevisionID       string            `json:"revision_id"`      // Porter revision ID
+}
+
+// DiscoverPorterApps finds all Porter-managed applications in the cluster
+func (c *Client) DiscoverPorterApps() ([]PorterApp, error) {
+	ctx := context.Background()
+
+	// Find all deployments with Porter labels
+	deployments, err := c.clientset.AppsV1().Deployments("").List(ctx, metav1.ListOptions{
+		LabelSelector: "porter.run/porter-application=true",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Porter deployments: %w", err)
+	}
+
+	// Group services by app name
+	appGroups := make(map[string][]PorterService)
+
+	for _, deployment := range deployments.Items {
+		labels := deployment.Labels
+		appName := labels["porter.run/app-name"]
+		serviceName := labels["porter.run/service-name"]
+		serviceType := labels["porter.run/service-type"]
+
+		if appName == "" || serviceName == "" {
+			continue // Skip deployments without proper Porter labels
+		}
+
+		// Extract service configuration from deployment spec
+		service := PorterService{
+			ServiceName:    serviceName,
+			ServiceType:    serviceType,
+			DeploymentName: deployment.Name,
+			Namespace:      deployment.Namespace,
+			Replicas:       *deployment.Spec.Replicas,
+			AppID:          labels["porter.run/app-id"],
+			AppInstanceID:  labels["porter.run/app-instance-id"],
+			RevisionID:     labels["porter.run/app-revision-id"],
+			EnvVars:        make(map[string]string),
+		}
+
+		// Extract container configuration
+		if len(deployment.Spec.Template.Spec.Containers) > 0 {
+			container := deployment.Spec.Template.Spec.Containers[0]
+			service.Image = container.Image
+
+			// Extract port
+			if len(container.Ports) > 0 {
+				port := int(container.Ports[0].ContainerPort)
+				service.Port = &port
+			}
+
+			// Extract environment variables (non-secret)
+			for _, env := range container.Env {
+				if env.Value != "" {
+					service.EnvVars[env.Name] = env.Value
+				}
+			}
+
+			// Extract resource limits
+			if container.Resources.Requests != nil {
+				if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
+					service.CPURequest = cpu.String()
+				}
+				if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
+					service.MemoryRequest = mem.String()
+				}
+			}
+			if container.Resources.Limits != nil {
+				if cpu, ok := container.Resources.Limits[corev1.ResourceCPU]; ok {
+					service.CPULimit = cpu.String()
+				}
+				if mem, ok := container.Resources.Limits[corev1.ResourceMemory]; ok {
+					service.MemoryLimit = mem.String()
+				}
+			}
+
+			// Extract health check path
+			if container.LivenessProbe != nil && container.LivenessProbe.HTTPGet != nil {
+				service.HealthPath = container.LivenessProbe.HTTPGet.Path
+			}
+		}
+
+		// Check for associated ingress to get domain
+		ingresses, err := c.clientset.NetworkingV1().Ingresses(deployment.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("app.kubernetes.io/instance=%s", labels["app.kubernetes.io/instance"]),
+		})
+		if err == nil && len(ingresses.Items) > 0 {
+			// Get first domain from ingress rules
+			if len(ingresses.Items[0].Spec.Rules) > 0 {
+				service.Domain = ingresses.Items[0].Spec.Rules[0].Host
+			}
+		}
+
+		appGroups[appName] = append(appGroups[appName], service)
+	}
+
+	// Convert map to slice of PorterApp
+	var porterApps []PorterApp
+	for appName, services := range appGroups {
+		porterApps = append(porterApps, PorterApp{
+			AppName:  appName,
+			Services: services,
+		})
+	}
+
+	return porterApps, nil
 }

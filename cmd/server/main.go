@@ -14,6 +14,7 @@ import (
 	"github.com/vigneshsubbiah/shipit/internal/auth"
 	"github.com/vigneshsubbiah/shipit/internal/config"
 	"github.com/vigneshsubbiah/shipit/internal/db"
+	"github.com/vigneshsubbiah/shipit/internal/porter"
 )
 
 func main() {
@@ -36,8 +37,31 @@ func main() {
 
 	log.Println("Connected to database")
 
-	// Create router
-	router := api.NewRouter(database, cfg.EncryptKey)
+	// Create Porter discovery service
+	porterDiscovery := porter.NewDiscoveryService(database)
+
+	// Register existing clusters with Porter discovery
+	clusters, err := database.ListAllClustersWithKubeconfig(context.Background())
+	if err != nil {
+		log.Printf("Warning: Failed to load clusters for Porter discovery: %v", err)
+	} else {
+		for _, cluster := range clusters {
+			kubeconfig, err := auth.Decrypt(cluster.KubeconfigEncrypted, cfg.EncryptKey)
+			if err != nil {
+				log.Printf("Warning: Failed to decrypt kubeconfig for cluster %s: %v", cluster.Name, err)
+				continue
+			}
+			porterDiscovery.RegisterCluster(cluster.ID, kubeconfig)
+		}
+		log.Printf("Registered %d clusters with Porter discovery", len(clusters))
+	}
+
+	// Start Porter discovery in background
+	discoveryCtx, discoveryCancel := context.WithCancel(context.Background())
+	go porterDiscovery.Start(discoveryCtx)
+
+	// Create router with Porter discovery service
+	router := api.NewRouter(database, cfg, porterDiscovery)
 
 	// Create server
 	server := &http.Server{
@@ -62,6 +86,10 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down server...")
+
+	// Stop Porter discovery service
+	discoveryCancel()
+	porterDiscovery.Stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
