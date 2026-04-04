@@ -105,6 +105,11 @@ func NewRouter(database *db.DB, cfg *config.Config, porterDiscovery *porter.Disc
 			r.Get("/predeploy", h.GetPreDeployHook)
 			r.Put("/predeploy", h.SetPreDeployHook)
 
+			// Exec - run commands in containers
+			r.Post("/exec", h.ExecCommand)
+			r.Get("/exec/interactive", h.ExecInteractive)
+			r.Delete("/exec/cleanup", h.CleanupExec)
+
 			// Porter migration - switchover
 			r.Put("/switchover", h.SwitchAppManagement)
 		})
