@@ -3,6 +3,8 @@ package k8s
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,11 +22,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/remotecommand"
+	utilexec "k8s.io/client-go/util/exec"
 )
 
 type Client struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
+	config    *rest.Config
 }
 
 type ClusterInfo struct {
@@ -119,7 +126,7 @@ func NewClient(kubeconfig []byte) (*Client, error) {
 		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	return &Client{clientset: clientset}, nil
+	return &Client{clientset: clientset, config: config}, nil
 }
 
 func (c *Client) GetClusterInfo() (*ClusterInfo, error) {
@@ -892,7 +899,12 @@ func (c *Client) GetPodMetrics(namespace string, labelSelector string) (map[stri
 	ctx := context.Background()
 
 	// Use the REST client to query metrics.k8s.io API
-	result := c.clientset.RESTClient().Get().
+	// Type-assert to *kubernetes.Clientset for RESTClient() which is not on the Interface.
+	cs, ok := c.clientset.(*kubernetes.Clientset)
+	if !ok {
+		return nil, fmt.Errorf("metrics API requires a real Kubernetes clientset")
+	}
+	result := cs.RESTClient().Get().
 		AbsPath("/apis/metrics.k8s.io/v1beta1").
 		Resource("pods").
 		Namespace(namespace).
@@ -1465,4 +1477,267 @@ func (c *Client) DiscoverPorterApps() ([]PorterApp, error) {
 	}
 
 	return porterApps, nil
+}
+
+// EphemeralPodRequest contains parameters for creating an ephemeral pod
+type EphemeralPodRequest struct {
+	AppName    string
+	Namespace  string
+	Image      string
+	EnvVars    map[string]string
+	SecretName string   // K8s Secret name for EnvFrom injection
+	CPU        string   // e.g., "500m"
+	RAM        string   // e.g., "512Mi"
+	Command    []string // command to run
+}
+
+// FindRunningPod finds a running pod for the given app and returns the pod name and container name.
+// If container is non-empty, it validates that the container exists in the pod spec.
+// If container is empty, it returns the first container in the pod spec.
+func (c *Client) FindRunningPod(ctx context.Context, namespace, appName, container string) (podName string, containerName string, err error) {
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", appName),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return "", "", fmt.Errorf("no pods found for app %s", appName)
+	}
+
+	// Find first pod that is Ready
+	for _, pod := range pods.Items {
+		ready := false
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			continue
+		}
+
+		if len(pod.Spec.Containers) == 0 {
+			continue
+		}
+
+		// Resolve container name
+		if container != "" {
+			found := false
+			for _, c := range pod.Spec.Containers {
+				if c.Name == container {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return "", "", fmt.Errorf("container %q not found in pod %s", container, pod.Name)
+			}
+			return pod.Name, container, nil
+		}
+
+		return pod.Name, pod.Spec.Containers[0].Name, nil
+	}
+
+	return "", "", fmt.Errorf("no running pods found for app %s", appName)
+}
+
+// CreateEphemeralPod creates a short-lived pod for running commands in the cluster.
+// The pod runs sleep and is meant to be used with ExecInPod for interactive or one-shot commands.
+// Returns the pod name once it reaches Running phase.
+func (c *Client) CreateEphemeralPod(ctx context.Context, req EphemeralPodRequest) (string, error) {
+	suffix, err := randomSuffix(8)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate pod name suffix: %w", err)
+	}
+	podName := fmt.Sprintf("%s-run-%s", req.AppName, suffix)
+
+	// Build env vars
+	var envVars []corev1.EnvVar
+	for k, v := range req.EnvVars {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+	}
+
+	container := corev1.Container{
+		Name:    "run",
+		Image:   req.Image,
+		Command: []string{"sleep", "3600"},
+		Env:     envVars,
+	}
+
+	// Inject secrets if specified
+	if req.SecretName != "" {
+		container.EnvFrom = []corev1.EnvFromSource{{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: req.SecretName,
+				},
+			},
+		}}
+	}
+
+	// Set resource requests if provided
+	if req.CPU != "" || req.RAM != "" {
+		container.Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{},
+		}
+		if req.CPU != "" {
+			qty, err := resource.ParseQuantity(req.CPU)
+			if err != nil {
+				return "", fmt.Errorf("invalid CPU value %q: %w", req.CPU, err)
+			}
+			container.Resources.Requests[corev1.ResourceCPU] = qty
+		}
+		if req.RAM != "" {
+			qty, err := resource.ParseQuantity(req.RAM)
+			if err != nil {
+				return "", fmt.Errorf("invalid RAM value %q: %w", req.RAM, err)
+			}
+			container.Resources.Requests[corev1.ResourceMemory] = qty
+		}
+	}
+
+	activeDeadline := int64(3600)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: req.Namespace,
+			Labels: map[string]string{
+				"app":                  req.AppName,
+				"shipit.dev/ephemeral": "true",
+				"shipit.dev/app":       req.AppName,
+				"managed-by":           "shipit",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:         corev1.RestartPolicyNever,
+			ActiveDeadlineSeconds: &activeDeadline,
+			Containers:            []corev1.Container{container},
+		},
+	}
+
+	_, err = c.clientset.CoreV1().Pods(req.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to create ephemeral pod: %w", err)
+	}
+
+	// Wait for pod to reach Running phase
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			// Clean up on timeout — use a fresh context since the parent may already be canceled
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			_ = c.clientset.CoreV1().Pods(req.Namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
+			return "", fmt.Errorf("timed out waiting for pod %s to start", podName)
+		case <-ticker.C:
+			current, err := c.clientset.CoreV1().Pods(req.Namespace).Get(ctx, podName, metav1.GetOptions{})
+			if err != nil {
+				continue
+			}
+			switch current.Status.Phase {
+			case corev1.PodRunning:
+				return podName, nil
+			case corev1.PodFailed, corev1.PodSucceeded, corev1.PodUnknown:
+				return "", fmt.Errorf("pod %s entered unexpected phase: %s", podName, current.Status.Phase)
+			}
+		}
+	}
+}
+
+// ExecInPod executes a command in a running pod container via SPDY.
+// Returns the exit code and any connection-level error.
+// Exit code 0 means success; positive exit codes indicate the command failed;
+// -1 with a non-nil error indicates a connection/protocol error.
+func (c *Client) ExecInPod(ctx context.Context, namespace, podName, container string, command []string, stdin io.Reader, stdout, stderr io.Writer, tty bool) (int, error) {
+	execOpts := &corev1.PodExecOptions{
+		Container: container,
+		Command:   command,
+		TTY:       tty,
+	}
+	if stdin != nil {
+		execOpts.Stdin = true
+	}
+	if stdout != nil {
+		execOpts.Stdout = true
+	}
+	if stderr != nil && !tty {
+		execOpts.Stderr = true
+	}
+
+	req := c.clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(execOpts, scheme.ParameterCodec)
+
+	executor, err := remotecommand.NewSPDYExecutor(c.config, "POST", req.URL())
+	if err != nil {
+		return -1, fmt.Errorf("failed to create SPDY executor: %w", err)
+	}
+
+	streamOpts := remotecommand.StreamOptions{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Tty:    tty,
+	}
+	if stderr != nil && !tty {
+		streamOpts.Stderr = stderr
+	}
+
+	err = executor.StreamWithContext(ctx, streamOpts)
+	if err == nil {
+		return 0, nil
+	}
+
+	// Check if it's an exit code error from the remote command
+	if exitErr, ok := err.(utilexec.ExitError); ok {
+		return exitErr.ExitStatus(), nil
+	}
+
+	return -1, err
+}
+
+// CleanupEphemeralPods deletes all ephemeral pods for the given app.
+// Returns the number of pods deleted.
+func (c *Client) CleanupEphemeralPods(ctx context.Context, namespace, appName string) (int, error) {
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("shipit.dev/ephemeral=true,shipit.dev/app=%s", appName),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to list ephemeral pods: %w", err)
+	}
+
+	deleted := 0
+	for _, pod := range pods.Items {
+		if err := c.clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+			return deleted, fmt.Errorf("failed to delete pod %s: %w", pod.Name, err)
+		}
+		deleted++
+	}
+
+	return deleted, nil
+}
+
+// DeletePod deletes a single pod by name.
+func (c *Client) DeletePod(ctx context.Context, namespace, podName string) error {
+	return c.clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+}
+
+// randomSuffix generates a random hex string of the given length.
+func randomSuffix(length int) (string, error) {
+	b := make([]byte, (length+1)/2)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b)[:length], nil
 }

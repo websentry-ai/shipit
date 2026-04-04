@@ -7,12 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var (
@@ -437,7 +442,260 @@ func appsCmd() *cobra.Command {
 	rollbackCmd.Flags().Int("revision", 0, "Specific revision number to rollback to (default: previous)")
 	cmd.AddCommand(rollbackCmd)
 
+	cmd.AddCommand(runCmd())
+
 	return cmd
+}
+
+// Run commands in containers
+
+func runCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "run <app-id> [flags] -- COMMAND [args...]",
+		Short: "Run a command in a container",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return fmt.Errorf("app-id is required")
+			}
+
+			// Split args at the -- separator.
+			// ArgsLenAtDash returns -1 if no -- was provided.
+			var appID string
+			var command []string
+			dashAt := cmd.ArgsLenAtDash()
+			if dashAt >= 0 {
+				appID = args[0]
+				command = args[dashAt:]
+			} else {
+				appID = args[0]
+				command = nil
+			}
+
+			interactive, _ := cmd.Flags().GetBool("interactive")
+			existingPod, _ := cmd.Flags().GetBool("existing-pod")
+			container, _ := cmd.Flags().GetString("container")
+			cpu, _ := cmd.Flags().GetInt("cpu")
+			ram, _ := cmd.Flags().GetInt("ram")
+			verbose, _ := cmd.Flags().GetBool("verbose")
+
+			if existingPod && (cpu > 0 || ram > 0) {
+				fmt.Fprintln(os.Stderr, "Warning: --cpu and --ram are ignored when using --existing-pod")
+			}
+
+			var exitCode int
+			var err error
+			if interactive {
+				exitCode, err = runInteractive(appID, command, existingPod, container, cpu, ram)
+			} else {
+				if len(command) == 0 {
+					return fmt.Errorf("command is required after -- (e.g., shipit app run <app-id> -- echo hello)")
+				}
+				exitCode, err = runNonInteractive(appID, command, existingPod, container, cpu, ram, verbose)
+			}
+			if err != nil {
+				return err
+			}
+			if exitCode != 0 {
+				os.Exit(exitCode)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolP("interactive", "i", false, "Attach stdin/stdout/tty for interactive shell")
+	cmd.Flags().BoolP("existing-pod", "e", false, "Exec into running pod instead of ephemeral")
+	cmd.Flags().StringP("container", "c", "", "Target container name in multi-container pod")
+	cmd.Flags().Int("cpu", 0, "CPU millicores for ephemeral pod (e.g., 500)")
+	cmd.Flags().Int("ram", 0, "RAM in Mi for ephemeral pod (e.g., 512)")
+	cmd.Flags().Bool("verbose", false, "Print debug info (pod name, namespace)")
+
+	cmd.AddCommand(cleanupCmd())
+
+	return cmd
+}
+
+func runNonInteractive(appID string, command []string, existingPod bool, container string, cpu, ram int, verbose bool) (int, error) {
+	body := map[string]interface{}{
+		"command":      command,
+		"existing_pod": existingPod,
+	}
+	if container != "" {
+		body["container"] = container
+	}
+	if cpu > 0 && !existingPod {
+		body["cpu"] = fmt.Sprintf("%dm", cpu)
+	}
+	if ram > 0 && !existingPod {
+		body["ram"] = fmt.Sprintf("%dMi", ram)
+	}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", apiURL+"/api/apps/"+appID+"/exec", bytes.NewReader(data))
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Stdout   string `json:"stdout"`
+		Stderr   string `json:"stderr"`
+		ExitCode int    `json:"exit_code"`
+		PodName  string `json:"pod_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "pod: %s\n", result.PodName)
+	}
+
+	fmt.Fprint(os.Stdout, result.Stdout)
+
+	if result.Stderr != "" {
+		fmt.Fprint(os.Stderr, result.Stderr)
+	}
+
+	return result.ExitCode, nil
+}
+
+func runInteractive(appID string, command []string, existingPod bool, container string, cpu, ram int) (int, error) {
+	if len(command) == 0 {
+		command = []string{"/bin/sh"}
+	}
+
+	// Build WebSocket URL from apiURL
+	wsURL := strings.Replace(apiURL, "https://", "wss://", 1)
+	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
+	wsURL += "/api/apps/" + appID + "/exec/interactive"
+
+	params := url.Values{}
+	if existingPod {
+		params.Set("existing_pod", "true")
+	}
+	if container != "" {
+		params.Set("container", container)
+	}
+	if cpu > 0 && !existingPod {
+		params.Set("cpu", fmt.Sprintf("%dm", cpu))
+	}
+	if ram > 0 && !existingPod {
+		params.Set("ram", fmt.Sprintf("%dMi", ram))
+	}
+	if len(params) > 0 {
+		wsURL += "?" + params.Encode()
+	}
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+apiToken)
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		return 0, fmt.Errorf("failed to connect: %w", err)
+	}
+	defer conn.Close()
+
+	// Send command as first message
+	if err := conn.WriteJSON(map[string]interface{}{"command": command}); err != nil {
+		return 0, fmt.Errorf("failed to send command: %w", err)
+	}
+
+	// Put terminal in raw mode
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return 0, fmt.Errorf("failed to set raw terminal: %w", err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// Handle signals to restore terminal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		term.Restore(int(os.Stdin.Fd()), oldState)
+		os.Exit(1)
+	}()
+
+	// stdin -> WebSocket
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
+	// WebSocket -> stdout
+	exitCode := 0
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		var ctrlMsg struct {
+			Type     string `json:"type"`
+			ExitCode *int   `json:"exit_code"`
+			Message  string `json:"message"`
+		}
+		if json.Unmarshal(message, &ctrlMsg) == nil && ctrlMsg.Type != "" {
+			if ctrlMsg.Type == "exit" && ctrlMsg.ExitCode != nil {
+				exitCode = *ctrlMsg.ExitCode
+				break
+			}
+			if ctrlMsg.Type == "error" && ctrlMsg.Message != "" {
+				fmt.Fprintf(os.Stderr, "exec error: %s\n", ctrlMsg.Message)
+			}
+			continue
+		}
+		os.Stdout.Write(message)
+	}
+
+	term.Restore(int(os.Stdin.Fd()), oldState)
+	return exitCode, nil
+}
+
+func cleanupCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cleanup <app-id>",
+		Short: "Clean up orphaned ephemeral pods",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			resp, err := apiRequest("DELETE", "/api/apps/"+args[0]+"/exec/cleanup", nil)
+			if err != nil {
+				fatal(err)
+			}
+			var result struct {
+				Deleted int `json:"deleted"`
+			}
+			if err := json.Unmarshal(resp, &result); err != nil {
+				fatal(fmt.Errorf("failed to parse response: %w", err))
+			}
+			fmt.Printf("Cleaned up %d ephemeral pod(s)\n", result.Deleted)
+		},
+	}
 }
 
 // Deploy
