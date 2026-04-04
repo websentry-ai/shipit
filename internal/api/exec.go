@@ -302,10 +302,16 @@ func (h *Handler) ExecInteractive(w http.ResponseWriter, r *http.Request) {
 	mu := &sync.Mutex{}
 	wsWriter := &wsTextWriter{conn: conn, mu: mu}
 
-	exitCode, _ := client.ExecInPod(ctx, app.Namespace, podName, containerName, wsReq.Command, stdinReader, wsWriter, wsWriter, true)
+	exitCode, execErr := client.ExecInPod(ctx, app.Namespace, podName, containerName, wsReq.Command, stdinReader, wsWriter, wsWriter, true)
+
+	if execErr != nil {
+		mu.Lock()
+		conn.WriteJSON(map[string]string{"type": "error", "message": execErr.Error()})
+		mu.Unlock()
+	}
 
 	mu.Lock()
-	conn.WriteJSON(map[string]int{"exit_code": exitCode})
+	conn.WriteJSON(map[string]interface{}{"type": "exit", "exit_code": exitCode})
 	mu.Unlock()
 }
 

@@ -1633,8 +1633,10 @@ func (c *Client) CreateEphemeralPod(ctx context.Context, req EphemeralPodRequest
 	for {
 		select {
 		case <-timeoutCtx.Done():
-			// Clean up on timeout
-			_ = c.clientset.CoreV1().Pods(req.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+			// Clean up on timeout — use a fresh context since the parent may already be canceled
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cleanupCancel()
+			_ = c.clientset.CoreV1().Pods(req.Namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
 			return "", fmt.Errorf("timed out waiting for pod %s to start", podName)
 		case <-ticker.C:
 			current, err := c.clientset.CoreV1().Pods(req.Namespace).Get(ctx, podName, metav1.GetOptions{})

@@ -655,12 +655,20 @@ func runInteractive(appID string, command []string, existingPod bool, container 
 		if err != nil {
 			break
 		}
-		var exitMsg struct {
-			ExitCode *int `json:"exit_code"`
+		var ctrlMsg struct {
+			Type     string `json:"type"`
+			ExitCode *int   `json:"exit_code"`
+			Message  string `json:"message"`
 		}
-		if json.Unmarshal(message, &exitMsg) == nil && exitMsg.ExitCode != nil {
-			exitCode = *exitMsg.ExitCode
-			break
+		if json.Unmarshal(message, &ctrlMsg) == nil && ctrlMsg.Type != "" {
+			if ctrlMsg.Type == "exit" && ctrlMsg.ExitCode != nil {
+				exitCode = *ctrlMsg.ExitCode
+				break
+			}
+			if ctrlMsg.Type == "error" && ctrlMsg.Message != "" {
+				fmt.Fprintf(os.Stderr, "exec error: %s\n", ctrlMsg.Message)
+			}
+			continue
 		}
 		os.Stdout.Write(message)
 	}
