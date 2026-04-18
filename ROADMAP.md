@@ -20,9 +20,10 @@ This document tracks planned features, development phases, implementation detail
 | Phase 2.8: Google SSO | ✅ Complete | 100% |
 | Phase 2.9: Default App URLs | ✅ Complete | 100% |
 | Phase 2.10: Design System & Dark Mode | 🟡 In Progress | 0% |
+| Phase 2.11: Zero-Downtime Deployment Defaults | 🔴 Planning (P0) | 0% |
 | Phase 3: Porter Migration | 🟡 Planning | 0% |
 | Phase 4: Observability & Alerts | 🟡 Planning | 0% |
-| Phase 5: CI/CD Integration | 🟡 Planning | 0% |
+| Phase 5: Branch Tracking & CI/CD Integration | 🔴 Planning (P0) | 0% |
 | Phase 6: Advanced Features | 🟡 Planning | 0% |
 
 ---
@@ -104,7 +105,95 @@ api_tokens (id, token_hash, name, created_at)
 
 ## Upcoming Phases (v1.0+)
 
-### Phase 3: Porter Migration & Coexistence
+### Phase 2.11: Zero-Downtime Deployment Defaults (P0)
+
+**Status**: Planning
+**Priority**: P0 (observed production issue: `prod-coding-discovery` currently has no probes, no PDB, no topology spread — a routine node drain would cause a full outage)
+
+Shipit's value proposition is that users don't write Kubernetes YAML. The corollary: shipit must produce production-safe Deployments by default. Every app should survive a node drain, a rolling update, and a pod OOM without any user-visible downtime.
+
+#### 2.11.0 Observed Problem (Motivation)
+
+Cluster audit of `prod-coding-discovery` (4 replicas, managed-by: shipit) on 2026-04-18:
+
+| Gap | Impact |
+|---|---|
+| No `readinessProbe` | Ingress routes to containers the instant they start → 502s during rolling updates |
+| No `livenessProbe` | Hung/deadlocked pods stay in rotation forever |
+| No `PodDisruptionBudget` | Node drain (cluster upgrade, Karpenter scale-down, spot reclaim) can evict all 4 pods at once → full outage |
+| No `topologySpreadConstraints` / `podAntiAffinity` | Today's 4-node spread is coincidence; reschedule could pile all pods on one node |
+| No `preStop` hook | Container exits before ingress endpoint-slice propagation (~5s) → dropped in-flight requests during rollout |
+| Image `:latest` + `imagePullPolicy: Always` | Mixed-digest fleet; same Deployment, different code per pod |
+| No auto-rollback | Failed rollouts stay half-applied |
+
+DB schema already has `health_path/port/initial_delay/period` columns — they're optional and unset for this app. Optional ≠ safe default.
+
+#### 2.11.1 Design Principle — "Can't deploy unsafely even if you try"
+
+Three tiers of smart-ness:
+
+**Tier 1 — Required at app creation (block deploy if missing)**:
+- `health_path` (probe endpoint) — fall back to TCP probe on container port only if explicitly opted out
+- `resource.cpu_request`, `resource.memory_request` — without these, pods are BestEffort class = first to evict under pressure
+- `max_request_duration_seconds` — derives termination grace period + ingress timeouts + progress deadline
+
+**Tier 2 — Fully automated from Tier 1 inputs (no user input)**:
+- PDB, topology spread, preStop, probes, surge/unavail, priority class, image tagging
+
+**Tier 3 — Observed & auto-tuned over time**:
+- `startupProbe` thresholds (from first-deploy cold-start p99)
+- Resource right-sizing suggestions (VPA-style, observed actual)
+- Termination grace tuning (observed in-flight request drain time)
+
+#### 2.11.2 Parameter Derivation Logic
+
+| Parameter | Derivation | Notes |
+|---|---|---|
+| `readinessProbe` | HTTP GET on `health_path`; `periodSeconds: 5`, `timeoutSeconds: 3`, `failureThreshold: 3`, `successThreshold: 1` | Mandatory. If no `health_path`, fall back to TCP check on declared port. |
+| `livenessProbe` | Same endpoint, `periodSeconds: 10`, `failureThreshold: 5`, `initialDelaySeconds: 30` | Separate from readiness so slow-starters don't get killed during warmup. |
+| `startupProbe` | Same endpoint, `periodSeconds: 5`, `failureThreshold: ceil(p99_coldstart / 5) + 3` | Auto-measure p99 on first deploy; re-tune every deploy. |
+| `PodDisruptionBudget` | `minAvailable = max(replicas - 1, 1)` if replicas ≥ 2; skip if replicas = 1 | Always created as sibling resource when replicas ≥ 2. |
+| `topologySpreadConstraints` | Two constraints: `topology.kubernetes.io/zone` and `kubernetes.io/hostname`, `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway` | Universal. No app knowledge needed. |
+| `terminationGracePeriodSeconds` | `max_request_duration_seconds + 10s buffer`; floor 30s | User-declared "longest request" (30s default, 120s for LLM/streaming apps). |
+| `preStop` hook | `exec: ["/bin/sh", "-c", "sleep 5"]` | Covers endpoint-slice propagation to ingress. Single biggest win against rolling-update 5xx. |
+| `maxSurge` / `maxUnavailable` | `replicas ≤ 3` → `maxSurge: 1, maxUnavailable: 0`; else `25% / 25%` | Never lose capacity for small fleets. |
+| `progressDeadlineSeconds` | `max(600, startup_p99 * 3 * replicas)` | Fail visibly if rollout stalls. |
+| `revisionHistoryLimit` | `10` | Enables rollback chain. |
+| `image` | `repo:<sha>` (from Phase 5) | Never `:latest`. |
+| `imagePullPolicy` | `IfNotPresent` | Safe with immutable tags. |
+| `priorityClassName` | `shipit-production` (defined once at cluster level, non-zero) | Preferred under cluster pressure over batch jobs. |
+| HPA `minReplicas` | `max(configured, 2)` for prod apps | Prevent scale-to-one that breaks PDB + creates SPOF. |
+| Ingress `proxy-next-upstream` | `error timeout http_502 http_503 http_504` | Retry around pods in-flight of termination. |
+| Ingress `proxy-read-timeout` | `max_request_duration_seconds + 5s` | Don't cut off legitimate long requests. |
+| ALB deregistration delay | `terminationGracePeriodSeconds` (or ≥ that) | Set via ingress annotation if shipit owns ALB config. |
+
+#### 2.11.3 Implementation Scope
+
+- [ ] **Deployment renderer** (`internal/k8s/render.go` or similar): single function `RenderDeployment(app) (*appsv1.Deployment, *policyv1.PodDisruptionBudget, *autoscalingv2.HorizontalPodAutoscaler)` that emits all three resources with the derivations above
+- [ ] **DB schema**: add `max_request_duration_seconds` (int), `startup_p99_ms` (int, auto-populated), keep existing probe columns
+- [ ] **App creation validation**: reject creation if `health_path` or `resource_*` missing (API 400 with clear remediation message)
+- [ ] **Migration for existing apps**: one-time job that backfills sane defaults for all apps currently managed by shipit; show a "health warning" in UI for apps where the renderer would change spec (diff preview before apply)
+- [ ] **PDB creation**: ensure shipit has RBAC to manage `policy/v1 PodDisruptionBudget` in app namespaces
+- [ ] **Startup probe auto-tuning**: on each deploy, measure time from pod `Ready=False → Ready=True`; persist p99 per app; feed into next render
+- [ ] **Auto-rollback**: watch rollout; if new ReplicaSet fails to become Available within `progressDeadlineSeconds`, trigger `kubectl rollout undo` + mark deploy failed + Slack alert
+- [ ] **Health endpoint enforcement**: during deploy, after rollout completes, curl the `health_path` through the service → must return 2xx before marking deploy "successful"
+- [ ] **UI**: app creation form shows expandable "Advanced — reliability" section pre-populated with derived values, read-only but with "see reasoning" tooltips; app detail page shows current reliability posture (probes ✓/✗, PDB ✓/✗, etc.)
+- [ ] **Pre-flight check command**: `shipit app verify <id>` — reports any gaps between rendered ideal and actual cluster state (run after manual `kubectl edit` or drift)
+- [ ] **Documentation**: "Reliability Guarantees" page in README describing the exact defaults shipit applies
+
+#### 2.11.4 Acceptance Criteria
+
+A fresh app deployed via shipit should pass this test without any user effort:
+
+1. Cordon + drain any node hosting one of the app's pods — zero 5xx observed at the ingress.
+2. Kill a running pod (`kubectl delete pod`) — zero 5xx observed.
+3. Deploy a known-broken image (health endpoint returns 500) — deploy auto-rolls back within 10 min; previous version stays live; zero 5xx.
+4. Simultaneously scale the cluster down by 50% (Karpenter consolidation) — PDB prevents full outage; ≥ replicas-1 pods stay available.
+5. Deploy 10 commits to main in rapid succession — only the newest SHA ends up running (debounced); no mixed-digest fleet.
+
+---
+
+
 
 **Goal**: Migrate existing Porter apps to shipit while running both systems in parallel
 
@@ -205,31 +294,58 @@ Track deployment actions for compliance and debugging.
 
 ---
 
-### Phase 5: CI/CD Integration (Post-Switchover)
+### Phase 5: Branch Tracking & CI/CD Integration
 
-#### 5.1 GitHub Actions Integration
 **Status**: Planning
-**Priority**: P2 (blocked on Porter switchover)
+**Priority**: P0 (observed production issue: mixed image digests across pods in same Deployment; no auto-deploy on main merge)
 
-Auto-deploy on push/merge via GitHub Actions.
+Every shipit app should declare a git repo + branch and be automatically redeployed when that branch advances. This is the core PaaS promise (Heroku/Render/Fly/Railway parity) — without it, shipit is a fancy `kubectl apply` wrapper.
+
+#### 5.0 Observed Problem (Motivation)
+
+Audit of `prod-coding-discovery` on 2026-04-18 found:
+- Deployment image spec is `…/coding-discovery` (no tag) + `imagePullPolicy: Always` → effectively mutable `:latest`.
+- CI pushes new images on every main merge (`:<sha>` + moves `:latest`), but **shipit never patches the Deployment's image tag**.
+- Consequence: 4 running pods → 4 different image digests, **none matching current `:latest`**. Each pod picked up a different `:latest` whenever it happened to restart.
+- `kubectl rollout undo` is useless (both revisions reference the same mutable tag).
+
+Root cause: shipit treats image as a one-time field at app creation, not a continuously-reconciled output of "HEAD of tracked branch."
+
+#### 5.1 Branch Tracking (P0)
 
 **Design Decisions**:
 
 | Decision | Choice |
 |----------|--------|
-| Trigger method | GitHub Action calls shipit deploy API |
-| Deploy events | Configurable per-app (branch, tag pattern, manual) |
-| Authentication | User API tokens (stored as GitHub secret) |
-| Tooling | Example workflow file (copy-paste, simplest) |
+| Deploy trigger | GitHub webhook (push event) — instant, not poll-based |
+| Fallback trigger | CI calls shipit deploy API with explicit `:<sha>` (works pre-webhook) |
+| Image tag | Always immutable `:<sha>`, never `:latest` |
+| imagePullPolicy | `IfNotPresent` (since tags are immutable) |
+| Per-app config | `repo_url`, `tracked_branch`, `deploy_on_push` (bool), `build_context`, `dockerfile_path` |
+| Multi-branch | Support N apps pointing at same repo, different branches (prod=main, staging=develop) |
+| Auth | GitHub App (preferred) or fine-grained PAT stored encrypted |
 
 **Implementation Scope**:
-- [ ] Document deploy API for CI/CD use
-- [ ] Create example GitHub Actions workflow file
-- [ ] Add per-app "auto_deploy" config (branch/tag pattern)
-- [ ] Optional: Webhook endpoint for GitHub push events
-- [ ] Example workflow in repo: `.github/workflows/deploy.yml.example`
 
-**Example Workflow**:
+- [ ] **DB schema**: add columns to `apps`: `repo_url`, `tracked_branch`, `deploy_on_push`, `github_installation_id`, `last_deployed_sha`, `last_deployed_at`
+- [ ] **New table** `repositories`: id, url, installation_id, webhook_secret, connected_by_user_id, connected_at
+- [ ] **GitHub App registration** (shipit as a GitHub App; install per org; stores installation_id per repo)
+- [ ] **Webhook endpoint** `POST /api/webhooks/github` with HMAC verification (`X-Hub-Signature-256`)
+- [ ] **Webhook handler**: parse push event → find apps where `repo_url == payload.repository + tracked_branch == payload.ref.replace('refs/heads/','')` → enqueue deploy
+- [ ] **Deploy worker**: pulls job → patches Deployment `spec.template.spec.containers[0].image = repo:<sha>` → `kubectl rollout status` with timeout → writes revision → notifies Slack (phase 4.1 tie-in)
+- [ ] **Image build responsibility (decision required)**:
+  - Option A: CI builds + pushes, shipit webhook only triggers image-swap → simpler, user owns Dockerfile
+  - Option B: shipit runs its own build worker (clone → docker build → push to ECR) → Heroku-like, heavier infra
+  - Recommend A for v1, B for v2
+- [ ] **Concurrency**: queue deploys per app (FIFO); new pushes during in-flight deploy → drop intermediate, keep only newest (last-write-wins with debounce)
+- [ ] **Idempotency**: if `last_deployed_sha == incoming_sha`, skip
+- [ ] **Manual deploy API** (CI fallback): `POST /api/apps/{id}/deploy {sha, image}` — same code path as webhook
+- [ ] **UI**: on app detail page, show tracked branch, last deployed SHA, "Deploy latest" button, deploy history
+- [ ] **Rollback**: `kubectl rollout undo` works correctly once images are SHA-pinned
+- [ ] **Auto-rollback on failure**: if readiness of new ReplicaSet fails for >`progressDeadlineSeconds`, automatic `rollout undo` + mark deploy failed
+- [ ] **Remove `:latest` usage**: migration step — for every existing app, resolve current `:latest` digest to its SHA tag, update deployment spec
+
+**Example Workflow (CI fallback until webhook ships)**:
 ```yaml
 name: Deploy to Shipit
 on:
@@ -239,13 +355,23 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy to Shipit
+      - name: Build & push
         run: |
-          curl -X POST "https://shipit.unboundsec.dev/api/apps/$APP_ID/deploy" \
+          docker build -t $REGISTRY/$REPO:${{ github.sha }} .
+          docker push $REGISTRY/$REPO:${{ github.sha }}
+      - name: Trigger shipit deploy
+        run: |
+          curl -fsS -X POST "https://shipit.unboundsec.dev/api/apps/$APP_ID/deploy" \
             -H "Authorization: Bearer ${{ secrets.SHIPIT_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d '{"image": "your-registry/app:${{ github.sha }}"}'
+            -d '{"sha": "${{ github.sha }}", "image": "'$REGISTRY'/'$REPO':${{ github.sha }}"}'
 ```
+
+#### 5.2 Deploy Observability
+
+- [ ] Deploy timeline per app (commit → build → image push → rollout start → rollout complete or failed)
+- [ ] Surface each stage's duration in UI
+- [ ] Emit Slack event on deploy-succeeded / deploy-failed / auto-rolled-back
 
 ---
 
