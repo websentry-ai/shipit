@@ -99,7 +99,7 @@ func (c *Client) DeploymentProgressDeadline(ctx context.Context, name, namespace
 	if err != nil {
 		// Expected race on first-ever deploy (Create still in flight on slow
 		// etcd). Default is correct in that case; log at info only.
-		log.Printf("rollout: using default progress deadline %s for app=%s ns=%s (lookup: %v)", defaultProgressDeadline, name, namespace, err)
+		log.Printf("rollout: using default progress deadline %s for app=%s ns=%s err=%v", defaultProgressDeadline, name, namespace, err)
 		return defaultProgressDeadline
 	}
 	return progressDeadline(dep)
