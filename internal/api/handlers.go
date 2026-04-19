@@ -621,6 +621,23 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		return
 	}
 
+	// Rollout observation. Kube accepted the spec; now watch the
+	// Deployment's pods actually come up. A bounded ctx lets us detect
+	// stuck rollouts (ImagePullBackOff, CrashLoopBackOff) rather than
+	// reporting "running" purely because the apply succeeded.
+	h.db.UpdateAppStatus(ctx, appID, "verifying", nil)
+	deadline := client.DeploymentProgressDeadline(ctx, app.Name, app.Namespace) + 10*time.Second
+	watchCtx, cancel := context.WithTimeout(ctx, deadline)
+	watchErr := client.WatchRollout(watchCtx, app.Name, app.Namespace)
+	cancel()
+	if watchErr != nil {
+		log.Printf("deploy: rollout verification failed app=%s revision=%d err=%v", appID, newRevision, watchErr)
+		msg := "rollout did not become ready: " + watchErr.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
 	// Update app's current revision and status
 	h.db.UpdateAppRevision(ctx, appID, newRevision)
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
