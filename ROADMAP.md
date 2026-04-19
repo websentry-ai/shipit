@@ -20,7 +20,7 @@ This document tracks planned features, development phases, implementation detail
 | Phase 2.8: Google SSO | ✅ Complete | 100% |
 | Phase 2.9: Default App URLs | ✅ Complete | 100% |
 | Phase 2.10: Design System & Dark Mode | 🟡 In Progress | 0% |
-| Phase 2.11: Zero-Downtime Deployment Defaults | 🔴 Planning (P0) | 0% |
+| Phase 2.11: Zero-Downtime Deployment Defaults | 🟡 In Progress (P0) | ~30% |
 | Phase 3: Porter Migration | 🟡 Planning | 0% |
 | Phase 4: Observability & Alerts | 🟡 Planning | 0% |
 | Phase 5: Branch Tracking & CI/CD Integration | 🔴 Planning (P0) | 0% |
@@ -107,7 +107,7 @@ api_tokens (id, token_hash, name, created_at)
 
 ### Phase 2.11: Zero-Downtime Deployment Defaults (P0)
 
-**Status**: Planning
+**Status**: 🟡 In Progress (renderer + HPA wiring merged; validation / auto-rollback / FE pending)
 **Priority**: P0 (observed production issue: `prod-coding-discovery` currently has no probes, no PDB, no topology spread — a routine node drain would cause a full outage)
 
 Shipit's value proposition is that users don't write Kubernetes YAML. The corollary: shipit must produce production-safe Deployments by default. Every app should survive a node drain, a rolling update, and a pod OOM without any user-visible downtime.
@@ -169,15 +169,18 @@ Three tiers of smart-ness:
 
 #### 2.11.3 Implementation Scope
 
-- [ ] **Deployment renderer** (`internal/k8s/render.go` or similar): single function `RenderDeployment(app) (*appsv1.Deployment, *policyv1.PodDisruptionBudget, *autoscalingv2.HorizontalPodAutoscaler)` that emits all three resources with the derivations above
-- [ ] **DB schema**: add `max_request_duration_seconds` (int), `startup_p99_ms` (int, auto-populated), keep existing probe columns
-- [ ] **App creation validation**: reject creation if `health_path` or `resource_*` missing (API 400 with clear remediation message)
-- [ ] **Migration for existing apps**: one-time job that backfills sane defaults for all apps currently managed by shipit; show a "health warning" in UI for apps where the renderer would change spec (diff preview before apply)
-- [ ] **PDB creation**: ensure shipit has RBAC to manage `policy/v1 PodDisruptionBudget` in app namespaces
-- [ ] **Startup probe auto-tuning**: on each deploy, measure time from pod `Ready=False → Ready=True`; persist p99 per app; feed into next render
+- [x] **Deployment renderer — reliability primitives in `DeployApp()`** (commit 3de1e83): PDB reconciliation, topologySpread (zone + hostname), preStop `sleep 5`, split readiness/liveness probes with TCP fallback when HealthPath absent, RollingUpdate budget (1/0 for ≤3 replicas, 25%/25% above), explicit `imagePullPolicy` derived from tag immutability, `progressDeadlineSeconds`, `revisionHistoryLimit`, `terminationGracePeriodSeconds`
+- [x] **HPA wired into DeployApp** (commit 69de947): HPA reconciled on every deploy from the app record; MinReplicas clamped to ≥ 2 (logged WARN); preserves HPA-owned `Spec.Replicas` on Update to avoid fighting the controller; PDB `minAvailable` now uses `max(Replicas, HPAMin)` so HPA-scaled fleets get correct drain guarantees; SetAutoscaling handler writes DB before k8s so reconcileHPA converges on failure; deploy goroutine re-fetches app to avoid stale-snapshot races
+- [ ] **API / FE validation: min_replicas ≥ 2** — tighten `SetAutoscaling` to 400 on min < 2 and update FE default from 1 → 2, eliminating the UI↔cluster clamp divergence at the source (surfaced by elite-pr-review on 69de947)
+- [ ] **FE copy: static Replicas ignored while HPA enabled** — avoid user confusion when Replicas field edits appear to do nothing (surfaced by architect sign-off on 69de947)
+- [ ] **Per-app deploy mutex** — `sync.Map[appID]*sync.Mutex` around `deployApp()` entry to serialize overlapping deploys on the same app (race hazard grew once reconcileHPA runs every deploy)
 - [ ] **Auto-rollback**: watch rollout; if new ReplicaSet fails to become Available within `progressDeadlineSeconds`, trigger `kubectl rollout undo` + mark deploy failed + Slack alert
+- [ ] **App creation validation**: reject creation if `health_path` or `resource_*` missing (API 400 with clear remediation message)
 - [ ] **Health endpoint enforcement**: during deploy, after rollout completes, curl the `health_path` through the service → must return 2xx before marking deploy "successful"
-- [ ] **UI**: app creation form shows expandable "Advanced — reliability" section pre-populated with derived values, read-only but with "see reasoning" tooltips; app detail page shows current reliability posture (probes ✓/✗, PDB ✓/✗, etc.)
+- [ ] **DB schema**: add `max_request_duration_seconds` (int), `startup_p99_ms` (int, auto-populated)
+- [ ] **Startup probe auto-tuning**: on each deploy, measure time from pod `Ready=False → Ready=True`; persist p99 per app; feed into next render
+- [ ] **Migration for existing apps**: one-time job / script that triggers a no-op redeploy for every `managed-by: shipit` app so the new renderer takes effect without manual intervention; surface a "reliability posture" badge in the UI
+- [ ] **UI**: app creation form shows expandable "Advanced — reliability" section pre-populated with derived values, read-only but with "see reasoning" tooltips; app detail page shows current reliability posture (probes ✓/✗, PDB ✓/✗, HPA ✓/✗)
 - [ ] **Pre-flight check command**: `shipit app verify <id>` — reports any gaps between rendered ideal and actual cluster state (run after manual `kubectl edit` or drift)
 - [ ] **Documentation**: "Reliability Guarantees" page in README describing the exact defaults shipit applies
 
