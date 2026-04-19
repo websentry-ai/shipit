@@ -632,9 +632,7 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	cancel()
 	if watchErr != nil {
 		log.Printf("deploy: rollout verification failed app=%s revision=%d err=%v", appID, newRevision, watchErr)
-		msg := "rollout did not become ready: " + watchErr.Error()
-		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
-		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		h.autoRollback(ctx, appID, app, client, newRevision, watchErr)
 		return
 	}
 
@@ -667,6 +665,67 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 
 	// Clean up old revisions (keep last 10)
 	h.db.DeleteOldRevisions(ctx, appID, 10)
+}
+
+// autoRollback is invoked when WatchRollout reports the new revision never
+// became healthy. It redeploys revision N-1 inline — same DeployApp path,
+// no watch on the rollback itself (v1). Called under the per-app deploy
+// mutex already held by deployApp.
+//
+// Revision-number math:
+//   - newRevision == 1 → nothing to roll back to; app stays "failed".
+//   - newRevision >  1 → rollback to N-1. On success, revision N is marked
+//     "rolled_back" and app's CurrentRevision is set to N-1. On failure,
+//     both errors are logged and app stays "failed".
+func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, client *k8s.Client, newRevision int, deployErr error) {
+	origMsg := "rollout did not become ready: " + deployErr.Error()
+
+	if newRevision <= 1 {
+		log.Printf("rollback: first-deploy-cannot-rollback app=%s revision=%d", appID, newRevision)
+		h.db.UpdateAppStatus(ctx, appID, "failed", &origMsg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &origMsg)
+		return
+	}
+
+	prior, err := h.db.GetRevision(ctx, appID, newRevision-1)
+	if err != nil {
+		log.Printf("rollback: prior-revision-missing app=%s revision=%d err=%v", appID, newRevision-1, err)
+		msg := origMsg + " | rollback aborted: prior revision " + strconv.Itoa(newRevision-1) + " not found: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
+	log.Printf("rollback: starting app=%s from=%d to=%d reason=%q", appID, newRevision, prior.RevisionNumber, deployErr.Error())
+	h.db.UpdateAppStatus(ctx, appID, "rolling_back", &origMsg)
+
+	// Env vars + secret name come from the revision snapshot. Secrets
+	// themselves are stored outside the revision, so we re-sync from the
+	// live secret rows (same as the forward path). This matches the manual
+	// RollbackApp handler's behavior and means a rollback can recover a
+	// deployment broken by an env-var change, but cannot recover one broken
+	// by a newly-added secret (expected — secrets aren't versioned).
+	var envVars map[string]string
+	if len(prior.EnvVars) > 0 {
+		_ = json.Unmarshal(prior.EnvVars, &envVars)
+	}
+	secretName := ""
+	if secrets, _ := h.db.GetSecretsByAppID(ctx, appID); len(secrets) > 0 {
+		secretName = app.Name + "-secrets"
+	}
+
+	if err := client.DeployApp(buildDeployRequestFromRevision(app, prior, h.appBaseDomain, secretName, envVars)); err != nil {
+		log.Printf("rollback: failed app=%s target_revision=%d err=%v original_err=%v", appID, prior.RevisionNumber, err, deployErr)
+		msg := origMsg + " | rollback to revision " + strconv.Itoa(prior.RevisionNumber) + " also failed: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
+	log.Printf("rollback: succeeded app=%s target_revision=%d", appID, prior.RevisionNumber)
+	h.db.UpdateAppRevision(ctx, appID, prior.RevisionNumber)
+	h.db.UpdateAppStatus(ctx, appID, "running", nil)
+	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "rolled_back", &origMsg)
 }
 
 func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {
