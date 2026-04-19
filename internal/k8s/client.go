@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +61,14 @@ type DeployRequest struct {
 	HealthPort         *int
 	HealthInitialDelay *int // seconds
 	HealthPeriod       *int // seconds
+
+	// HPA (auto-scaling) configuration. DeployApp reconciles the HPA every
+	// call: creates/updates when HPAEnabled, deletes when HPAEnabled=false.
+	HPAEnabled      bool
+	HPAMinReplicas  *int32
+	HPAMaxReplicas  *int32
+	HPATargetCPU    *int32
+	HPATargetMemory *int32
 
 	// Default ingress hostname (auto-generated URL)
 	BaseDomain string // e.g., "apps.shipit.unboundsec.dev" - if set, creates ingress at <name>.apps.shipit.unboundsec.dev
@@ -343,7 +352,13 @@ func (c *Client) DeployApp(req DeployRequest) error {
 			return fmt.Errorf("failed to create deployment: %w", err)
 		}
 	} else {
-		// Update existing deployment
+		// When HPA owns the replica count, preserve whatever the HPA last set.
+		// Writing req.Replicas (the static DB value) on every deploy would fight
+		// the HPA controller: a 4→12 scale-up would bounce back to 4 on the
+		// next redeploy. See https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+		if req.HPAEnabled && existing.Spec.Replicas != nil {
+			deployment.Spec.Replicas = existing.Spec.Replicas
+		}
 		deployment.ResourceVersion = existing.ResourceVersion
 		_, err = deploymentsClient.Update(ctx, deployment, metav1.UpdateOptions{})
 		if err != nil {
@@ -373,7 +388,62 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		return fmt.Errorf("failed to reconcile poddisruptionbudget: %w", err)
 	}
 
+	// HPA: reconciled from the same app record every deploy so the cluster
+	// never drifts from the UI/DB. CreateOrUpdateHPA deletes the HPA when
+	// Enabled=false, so this one call handles enable/update/disable.
+	if err := c.reconcileHPA(req); err != nil {
+		return fmt.Errorf("failed to reconcile hpa: %w", err)
+	}
+
 	return nil
+}
+
+// minHPAReplicas is the floor enforced when HPA is enabled. A single-replica
+// HPA creates a single point of failure, blocks the PodDisruptionBudget from
+// allowing any voluntary disruption, and defeats the zero-downtime guarantees
+// the rest of DeployApp works to provide.
+const minHPAReplicas = int32(2)
+
+// reconcileHPA translates the DeployRequest HPA fields into an HPAConfig and
+// applies it. Called unconditionally by DeployApp; CreateOrUpdateHPA handles
+// the disabled-case delete internally so there is no drift between deploys.
+//
+// Clamping to minHPAReplicas is logged at WARN so ops can correlate any
+// user-visible UI/DB drift (user sees min=1, cluster runs min=2) with a
+// specific deploy. The permanent fix is API-level validation in
+// SetAutoscaling + FE change; until then, the log trail lets us unblock
+// incident triage.
+func (c *Client) reconcileHPA(req DeployRequest) error {
+	cfg := HPAConfig{Enabled: req.HPAEnabled}
+	if req.HPAEnabled {
+		requested := int32(0)
+		if req.HPAMinReplicas != nil {
+			requested = *req.HPAMinReplicas
+		}
+		minR := requested
+		if minR < minHPAReplicas {
+			if requested > 0 {
+				log.Printf("hpa: clamped min_replicas from %d to %d for app=%s ns=%s (single-replica HPA is unsafe with PDB)", requested, minHPAReplicas, req.Name, req.Namespace)
+			}
+			minR = minHPAReplicas
+		}
+		maxR := int32(10)
+		if req.HPAMaxReplicas != nil && *req.HPAMaxReplicas > 0 {
+			maxR = *req.HPAMaxReplicas
+		}
+		if maxR < minR {
+			log.Printf("hpa: coerced max_replicas from %d to %d for app=%s ns=%s (max below min is invalid)", maxR, minR, req.Name, req.Namespace)
+			maxR = minR
+		}
+		cfg.MinReplicas = minR
+		cfg.MaxReplicas = maxR
+		cfg.TargetCPUPercent = req.HPATargetCPU
+		cfg.TargetMemPercent = req.HPATargetMemory
+		log.Printf("hpa: reconciling app=%s ns=%s enabled=true min=%d max=%d", req.Name, req.Namespace, minR, maxR)
+	} else {
+		log.Printf("hpa: reconciling app=%s ns=%s enabled=false (delete-if-exists)", req.Name, req.Namespace)
+	}
+	return c.CreateOrUpdateHPA(req.Name, req.Namespace, cfg)
 }
 
 // rollingUpdateBudget returns sane maxSurge/maxUnavailable per replica count.
@@ -431,13 +501,32 @@ func topologySpreadFor(appName string) []corev1.TopologySpreadConstraint {
 }
 
 // ensurePodDisruptionBudget reconciles a PDB that keeps at least
-// replicas-1 pods available during voluntary disruptions (node drains,
-// cluster upgrades, Karpenter consolidation). For replicas <= 1 we delete
-// any existing PDB rather than create a blocking one.
+// (effective replicas - 1) pods available during voluntary disruptions
+// (node drains, cluster upgrades, Karpenter consolidation).
+//
+// "Effective replicas" = max(static Replicas, HPA MinReplicas when HPA
+// enabled). This matters because an HPA-managed deployment typically runs
+// well above its static Replicas value; a PDB computed from Replicas=2 on
+// an HPA-scaled fleet of 10 would only guarantee 1 pod stays up during a
+// drain, which wastes the redundancy.
+//
+// For effective replicas <= 1 we delete any existing PDB rather than
+// create a blocking one.
 func (c *Client) ensurePodDisruptionBudget(ctx context.Context, req DeployRequest) error {
 	pdbs := c.clientset.PolicyV1().PodDisruptionBudgets(req.Namespace)
 
-	if req.Replicas <= 1 {
+	effective := req.Replicas
+	if req.HPAEnabled {
+		hpaMin := minHPAReplicas
+		if req.HPAMinReplicas != nil && *req.HPAMinReplicas > hpaMin {
+			hpaMin = *req.HPAMinReplicas
+		}
+		if hpaMin > effective {
+			effective = hpaMin
+		}
+	}
+
+	if effective <= 1 {
 		err := pdbs.Delete(ctx, req.Name, metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
@@ -445,7 +534,7 @@ func (c *Client) ensurePodDisruptionBudget(ctx context.Context, req DeployReques
 		return nil
 	}
 
-	minAvailable := intstr.FromInt(int(req.Replicas - 1))
+	minAvailable := intstr.FromInt(int(effective - 1))
 	desired := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      req.Name,
