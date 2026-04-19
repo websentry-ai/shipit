@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,6 +61,14 @@ type DeployRequest struct {
 	HealthPort         *int
 	HealthInitialDelay *int // seconds
 	HealthPeriod       *int // seconds
+
+	// HPA (auto-scaling) configuration. DeployApp reconciles the HPA every
+	// call: creates/updates when HPAEnabled, deletes when HPAEnabled=false.
+	HPAEnabled      bool
+	HPAMinReplicas  *int32
+	HPAMaxReplicas  *int32
+	HPATargetCPU    *int32
+	HPATargetMemory *int32
 
 	// Default ingress hostname (auto-generated URL)
 	BaseDomain string // e.g., "apps.shipit.unboundsec.dev" - if set, creates ingress at <name>.apps.shipit.unboundsec.dev
@@ -173,9 +183,21 @@ func (c *Client) DeployApp(req DeployRequest) error {
 
 	// Build container
 	container := corev1.Container{
-		Name:  req.Name,
-		Image: req.Image,
-		Env:   envVars,
+		Name:            req.Name,
+		Image:           req.Image,
+		Env:             envVars,
+		ImagePullPolicy: imagePullPolicyFor(req.Image),
+		// preStop delay covers kube-proxy/ingress endpoint propagation so in-flight
+		// requests are not dropped when the pod is removed from Service rotation
+		// during a rolling update. The /bin/sh fallback is a best-effort no-op on
+		// distroless images (kubelet treats a failed preStop exec as complete).
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{"/bin/sh", "-c", "sleep 5"},
+				},
+			},
+		},
 	}
 
 	// Inject secrets from K8s Secret if specified
@@ -213,7 +235,13 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		}
 	}
 
-	// Configure health probes if health path is specified
+	// Configure health probes. Preference order:
+	//   1. Explicit HealthPath  → HTTP GET probe on that path/port.
+	//   2. Port set, no HealthPath → TCP probe on the port (liveness + readiness).
+	//   3. Neither set → no probes (silent pods can't be safely rolled; warn upstream).
+	//
+	// Readiness and liveness are split so slow cold-starts don't cause restart loops:
+	// readiness polls often to gate ingress traffic; liveness polls slower to allow warmup.
 	if req.HealthPath != nil && *req.HealthPath != "" {
 		healthPort := req.Port
 		if req.HealthPort != nil {
@@ -225,28 +253,59 @@ func (c *Client) DeployApp(req DeployRequest) error {
 			initialDelay = int32(*req.HealthInitialDelay)
 		}
 
-		period := int32(30)
+		period := int32(10)
 		if req.HealthPeriod != nil {
 			period = int32(*req.HealthPeriod)
 		}
 
 		if healthPort != nil {
-			probe := &corev1.Probe{
-				ProbeHandler: corev1.ProbeHandler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: *req.HealthPath,
-						Port: intstr.FromInt(*healthPort),
-					},
+			handler := corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: *req.HealthPath,
+					Port: intstr.FromInt(*healthPort),
 				},
-				InitialDelaySeconds: initialDelay,
-				PeriodSeconds:       period,
 			}
-
-			// Use same config for both liveness and readiness probes
-			container.LivenessProbe = probe
-			container.ReadinessProbe = probe.DeepCopy()
+			container.ReadinessProbe = &corev1.Probe{
+				ProbeHandler:        handler,
+				InitialDelaySeconds: initialDelay,
+				PeriodSeconds:       5,
+				TimeoutSeconds:      3,
+				FailureThreshold:    3,
+				SuccessThreshold:    1,
+			}
+			container.LivenessProbe = &corev1.Probe{
+				ProbeHandler:        handler,
+				InitialDelaySeconds: initialDelay + 20,
+				PeriodSeconds:       period,
+				TimeoutSeconds:      3,
+				FailureThreshold:    5,
+			}
+		}
+	} else if req.Port != nil {
+		handler := corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(*req.Port)},
+		}
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler:        handler,
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       5,
+			TimeoutSeconds:      3,
+			FailureThreshold:    3,
+			SuccessThreshold:    1,
+		}
+		container.LivenessProbe = &corev1.Probe{
+			ProbeHandler:        handler,
+			InitialDelaySeconds: 30,
+			PeriodSeconds:       10,
+			TimeoutSeconds:      3,
+			FailureThreshold:    5,
 		}
 	}
+
+	maxSurge, maxUnavailable := rollingUpdateBudget(req.Replicas)
+	terminationGrace := int64(30)
+	progressDeadline := int32(600)
+	historyLimit := int32(10)
 
 	// Create or update deployment
 	deployment := &appsv1.Deployment{
@@ -260,12 +319,23 @@ func (c *Client) DeployApp(req DeployRequest) error {
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": req.Name},
 			},
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxSurge:       &maxSurge,
+					MaxUnavailable: &maxUnavailable,
+				},
+			},
+			ProgressDeadlineSeconds: &progressDeadline,
+			RevisionHistoryLimit:    &historyLimit,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"app": req.Name},
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{container},
+					Containers:                    []corev1.Container{container},
+					TerminationGracePeriodSeconds: &terminationGrace,
+					TopologySpreadConstraints:     topologySpreadFor(req.Name),
 				},
 			},
 		},
@@ -282,7 +352,13 @@ func (c *Client) DeployApp(req DeployRequest) error {
 			return fmt.Errorf("failed to create deployment: %w", err)
 		}
 	} else {
-		// Update existing deployment
+		// When HPA owns the replica count, preserve whatever the HPA last set.
+		// Writing req.Replicas (the static DB value) on every deploy would fight
+		// the HPA controller: a 4→12 scale-up would bounce back to 4 on the
+		// next redeploy. See https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+		if req.HPAEnabled && existing.Spec.Replicas != nil {
+			deployment.Spec.Replicas = existing.Spec.Replicas
+		}
 		deployment.ResourceVersion = existing.ResourceVersion
 		_, err = deploymentsClient.Update(ctx, deployment, metav1.UpdateOptions{})
 		if err != nil {
@@ -304,7 +380,186 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		}
 	}
 
+	// PDB: without this a node drain can evict every replica at once.
+	// Only meaningful for replicas >= 2; for single-replica apps a PDB of
+	// minAvailable=1 blocks all voluntary disruptions which is worse than
+	// accepting that a single-replica app is inherently non-HA.
+	if err := c.ensurePodDisruptionBudget(ctx, req); err != nil {
+		return fmt.Errorf("failed to reconcile poddisruptionbudget: %w", err)
+	}
+
+	// HPA: reconciled from the same app record every deploy so the cluster
+	// never drifts from the UI/DB. CreateOrUpdateHPA deletes the HPA when
+	// Enabled=false, so this one call handles enable/update/disable.
+	if err := c.reconcileHPA(req); err != nil {
+		return fmt.Errorf("failed to reconcile hpa: %w", err)
+	}
+
 	return nil
+}
+
+// minHPAReplicas is the floor enforced when HPA is enabled. A single-replica
+// HPA creates a single point of failure, blocks the PodDisruptionBudget from
+// allowing any voluntary disruption, and defeats the zero-downtime guarantees
+// the rest of DeployApp works to provide.
+const minHPAReplicas = int32(2)
+
+// reconcileHPA translates the DeployRequest HPA fields into an HPAConfig and
+// applies it. Called unconditionally by DeployApp; CreateOrUpdateHPA handles
+// the disabled-case delete internally so there is no drift between deploys.
+//
+// Clamping to minHPAReplicas is logged at WARN so ops can correlate any
+// user-visible UI/DB drift (user sees min=1, cluster runs min=2) with a
+// specific deploy. The permanent fix is API-level validation in
+// SetAutoscaling + FE change; until then, the log trail lets us unblock
+// incident triage.
+func (c *Client) reconcileHPA(req DeployRequest) error {
+	cfg := HPAConfig{Enabled: req.HPAEnabled}
+	if req.HPAEnabled {
+		requested := int32(0)
+		if req.HPAMinReplicas != nil {
+			requested = *req.HPAMinReplicas
+		}
+		minR := requested
+		if minR < minHPAReplicas {
+			if requested > 0 {
+				log.Printf("hpa: clamped min_replicas from %d to %d for app=%s ns=%s (single-replica HPA is unsafe with PDB)", requested, minHPAReplicas, req.Name, req.Namespace)
+			}
+			minR = minHPAReplicas
+		}
+		maxR := int32(10)
+		if req.HPAMaxReplicas != nil && *req.HPAMaxReplicas > 0 {
+			maxR = *req.HPAMaxReplicas
+		}
+		if maxR < minR {
+			log.Printf("hpa: coerced max_replicas from %d to %d for app=%s ns=%s (max below min is invalid)", maxR, minR, req.Name, req.Namespace)
+			maxR = minR
+		}
+		cfg.MinReplicas = minR
+		cfg.MaxReplicas = maxR
+		cfg.TargetCPUPercent = req.HPATargetCPU
+		cfg.TargetMemPercent = req.HPATargetMemory
+		log.Printf("hpa: reconciling app=%s ns=%s enabled=true min=%d max=%d", req.Name, req.Namespace, minR, maxR)
+	} else {
+		log.Printf("hpa: reconciling app=%s ns=%s enabled=false (delete-if-exists)", req.Name, req.Namespace)
+	}
+	return c.CreateOrUpdateHPA(req.Name, req.Namespace, cfg)
+}
+
+// rollingUpdateBudget returns sane maxSurge/maxUnavailable per replica count.
+// For small fleets (<=3 replicas) 25% rounds poorly, so we pin surge=1,
+// unavailable=0 to never lose capacity during a rollout.
+func rollingUpdateBudget(replicas int32) (intstr.IntOrString, intstr.IntOrString) {
+	if replicas <= 3 {
+		return intstr.FromInt(1), intstr.FromInt(0)
+	}
+	return intstr.FromString("25%"), intstr.FromString("25%")
+}
+
+// imagePullPolicyFor returns IfNotPresent for immutable tags (the expected
+// case once branch-tracking ships), Always for mutable tags we can detect.
+// Unknown/no tag falls back to IfNotPresent — callers should pin to :<sha>.
+func imagePullPolicyFor(image string) corev1.PullPolicy {
+	// Only consider the tag portion after the last colon that is NOT inside
+	// the registry port (registry:5000/repo:tag → tag after final colon).
+	at := strings.LastIndex(image, "@")
+	if at >= 0 {
+		return corev1.PullIfNotPresent // digest-pinned, always cacheable
+	}
+	slash := strings.LastIndex(image, "/")
+	tag := ""
+	if i := strings.LastIndex(image, ":"); i > slash {
+		tag = image[i+1:]
+	}
+	if tag == "latest" || tag == "" {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+// topologySpreadFor returns constraints that spread pods across zones and
+// nodes. whenUnsatisfiable=ScheduleAnyway so a constrained cluster still
+// schedules (vs DoNotSchedule which can wedge small clusters).
+func topologySpreadFor(appName string) []corev1.TopologySpreadConstraint {
+	labelSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"app": appName},
+	}
+	return []corev1.TopologySpreadConstraint{
+		{
+			MaxSkew:           1,
+			TopologyKey:       "topology.kubernetes.io/zone",
+			WhenUnsatisfiable: corev1.ScheduleAnyway,
+			LabelSelector:     labelSelector,
+		},
+		{
+			MaxSkew:           1,
+			TopologyKey:       "kubernetes.io/hostname",
+			WhenUnsatisfiable: corev1.ScheduleAnyway,
+			LabelSelector:     labelSelector,
+		},
+	}
+}
+
+// ensurePodDisruptionBudget reconciles a PDB that keeps at least
+// (effective replicas - 1) pods available during voluntary disruptions
+// (node drains, cluster upgrades, Karpenter consolidation).
+//
+// "Effective replicas" = max(static Replicas, HPA MinReplicas when HPA
+// enabled). This matters because an HPA-managed deployment typically runs
+// well above its static Replicas value; a PDB computed from Replicas=2 on
+// an HPA-scaled fleet of 10 would only guarantee 1 pod stays up during a
+// drain, which wastes the redundancy.
+//
+// For effective replicas <= 1 we delete any existing PDB rather than
+// create a blocking one.
+func (c *Client) ensurePodDisruptionBudget(ctx context.Context, req DeployRequest) error {
+	pdbs := c.clientset.PolicyV1().PodDisruptionBudgets(req.Namespace)
+
+	effective := req.Replicas
+	if req.HPAEnabled {
+		hpaMin := minHPAReplicas
+		if req.HPAMinReplicas != nil && *req.HPAMinReplicas > hpaMin {
+			hpaMin = *req.HPAMinReplicas
+		}
+		if hpaMin > effective {
+			effective = hpaMin
+		}
+	}
+
+	if effective <= 1 {
+		err := pdbs.Delete(ctx, req.Name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	}
+
+	minAvailable := intstr.FromInt(int(effective - 1))
+	desired := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.Name,
+			Namespace: req.Namespace,
+			Labels:    map[string]string{"app": req.Name, "managed-by": "shipit"},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &minAvailable,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": req.Name},
+			},
+		},
+	}
+
+	existing, err := pdbs.Get(ctx, req.Name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			_, err = pdbs.Create(ctx, desired, metav1.CreateOptions{})
+			return err
+		}
+		return err
+	}
+	desired.ResourceVersion = existing.ResourceVersion
+	_, err = pdbs.Update(ctx, desired, metav1.UpdateOptions{})
+	return err
 }
 
 func (c *Client) ensureNamespace(ctx context.Context, namespace string) error {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -468,6 +469,14 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		return
 	}
 
+	// Re-fetch the app inside the goroutine so we pick up any HPA / image /
+	// env changes the user made between the HTTP handler returning and this
+	// goroutine running. Prevents a SetAutoscaling (or similar) call mid-deploy
+	// from being silently reverted by the stale snapshot the caller passed in.
+	if fresh, err := h.db.GetApp(ctx, appID); err == nil {
+		app = fresh
+	}
+
 	// Create a revision snapshot before deploying
 	newRevision := app.CurrentRevision + 1
 	cpuReq := app.CPURequest
@@ -578,6 +587,13 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		HealthPort:         app.HealthPort,
 		HealthInitialDelay: app.HealthInitialDelay,
 		HealthPeriod:       app.HealthPeriod,
+		// HPA — reconciled every deploy from the app record so the cluster
+		// tracks UI/DB state; disabling removes the HPA cleanly.
+		HPAEnabled:      app.HPAEnabled,
+		HPAMinReplicas:  intPtrToInt32Ptr(app.MinReplicas),
+		HPAMaxReplicas:  intPtrToInt32Ptr(app.MaxReplicas),
+		HPATargetCPU:    intPtrToInt32Ptr(app.CPUTarget),
+		HPATargetMemory: intPtrToInt32Ptr(app.MemoryTarget),
 		// Default app URL
 		BaseDomain: h.appBaseDomain,
 	})
@@ -1008,12 +1024,11 @@ func (h *Handler) SetAutoscaling(w http.ResponseWriter, r *http.Request) {
 		TargetMemPercent: req.TargetMemPercent,
 	}
 
-	if err := client.CreateOrUpdateHPA(app.Name, app.Namespace, config); err != nil {
-		httpError(w, "failed to update autoscaling: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Persist HPA config to database
+	// DB is the source of truth for reconcileHPA (which runs on every deploy),
+	// so persist first. If the k8s write fails afterwards the next deploy will
+	// converge. The inverse ordering silently undoes user intent: k8s writes
+	// an HPA, DB write fails, next deploy reads stale DB row (Enabled=false)
+	// and deletes the HPA the user just created.
 	minRep := int(minReplicas)
 	maxRep := int(maxReplicas)
 	var cpuTgt, memTgt *int
@@ -1025,16 +1040,20 @@ func (h *Handler) SetAutoscaling(w http.ResponseWriter, r *http.Request) {
 		v := int(*req.TargetMemPercent)
 		memTgt = &v
 	}
-	_, err = h.db.UpdateAppHPA(r.Context(), db.UpdateAppHPAParams{
+	if _, err := h.db.UpdateAppHPA(r.Context(), db.UpdateAppHPAParams{
 		ID:           appID,
 		HPAEnabled:   req.Enabled,
 		MinReplicas:  &minRep,
 		MaxReplicas:  &maxRep,
 		CPUTarget:    cpuTgt,
 		MemoryTarget: memTgt,
-	})
-	if err != nil {
+	}); err != nil {
 		httpError(w, "failed to save autoscaling config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := client.CreateOrUpdateHPA(app.Name, app.Namespace, config); err != nil {
+		httpError(w, "failed to update autoscaling: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -1373,6 +1392,20 @@ func generateSecureToken() (string, error) {
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+func intPtrToInt32Ptr(p *int) *int32 {
+	if p == nil {
+		return nil
+	}
+	// Guard against surprise truncation if DB ever yields an out-of-range
+	// value. All current callers (HPA replicas / targets) are bounded well
+	// under int32; returning nil is a safer default than silently wrapping.
+	if *p < 0 || *p > math.MaxInt32 {
+		return nil
+	}
+	v := int32(*p)
+	return &v
 }
 
 // GetClusterIngress returns information about the cluster's ingress controller
