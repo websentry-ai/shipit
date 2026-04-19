@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,17 +131,48 @@ func TestWatchRollout_CtxCancelledExternally(t *testing.T) {
 	}
 }
 
-func TestWatchRollout_GetErrorSurfaces(t *testing.T) {
+// Persistent Get errors should NOT surface as a typed error — the watch
+// keeps retrying until ctx.Done(), which is what eventually fires. This
+// models an apiserver that's down for the whole progressDeadline window.
+func TestWatchRollout_PersistentGetErrorHitsCtxTimeout(t *testing.T) {
 	c := newTestClient()
 	c.clientset.(*fake.Clientset).PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("api server down")
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	err := c.WatchRollout(ctx, "svc", "default")
-	if err == nil || !strings.Contains(err.Error(), "api server down") {
-		t.Errorf("expected Get error surfaced, got %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected ctx deadline exceeded, got %v", err)
+	}
+}
+
+// Regression guard for Greptile P1 (comment 3106354508): a single transient
+// Get error must not trigger rollback. The watch should log the error, wait
+// for the next tick, and succeed when the deployment becomes ready.
+func TestWatchRollout_TransientGetErrorRecovers(t *testing.T) {
+	dep := readyDeployment("svc", "default", 2)
+	c := newTestClient(dep)
+
+	var calls int32
+	c.clientset.(*fake.Clientset).PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		// Fail the first Get, let subsequent Gets fall through to the fake
+		// store which has a ready deployment.
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return true, nil, errors.New("transient etcd leader election")
+		}
+		return false, nil, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := c.WatchRollout(ctx, "svc", "default")
+	if err != nil {
+		t.Errorf("transient Get error should not surface, got %v", err)
+	}
+	if atomic.LoadInt32(&calls) < 2 {
+		t.Errorf("expected at least 2 Get calls (retry after transient), got %d", calls)
 	}
 }
 

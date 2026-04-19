@@ -31,14 +31,22 @@ func (c *Client) WatchRollout(ctx context.Context, name, namespace string) error
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fmt.Errorf("watch rollout: get deployment: %w", err)
-		}
-
-		if rolloutReady(dep) {
-			return nil
-		}
-		if reason, failed := rolloutFailed(dep); failed {
-			return fmt.Errorf("rollout failed: %s", reason)
+			// Transient API errors (network blip, etcd leader election,
+			// apiserver 5xx) must NOT trigger an immediate rollback of a
+			// deploy whose pods may be converging fine. Log and retry on the
+			// next tick; the watch ctx (progressDeadline + 10s) is our total
+			// retry budget. If the apiserver is truly down for the whole
+			// window, we'll hit ctx.Err() below, which surfaces as a normal
+			// watch timeout and gets rolled back — that's the correct
+			// behavior for an unreachable control plane.
+			log.Printf("rollout: transient get error (retrying) app=%s ns=%s err=%v", name, namespace, err)
+		} else {
+			if rolloutReady(dep) {
+				return nil
+			}
+			if reason, failed := rolloutFailed(dep); failed {
+				return fmt.Errorf("rollout failed: %s", reason)
+			}
 		}
 
 		select {
