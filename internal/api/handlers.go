@@ -642,41 +642,62 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	// Mark revision as successful
 	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "success", nil)
 
-	// Sync Ingress if domain is configured
-	if app.Domain != nil && *app.Domain != "" {
-		port := 80
-		if app.Port != nil {
-			port = *app.Port
-		}
-		if err := client.CreateOrUpdateIngress(app.Name, app.Namespace, *app.Domain, port); err != nil {
-			// Log but don't fail the deploy
-			msg := "warning: failed to sync ingress: " + err.Error()
-			h.db.UpdateAppStatus(ctx, appID, "running", &msg)
-		} else {
-			// Update domain status to active
-			activeStatus := "active"
-			h.db.UpdateAppDomain(ctx, db.UpdateAppDomainParams{
-				ID:           appID,
-				Domain:       app.Domain,
-				DomainStatus: &activeStatus,
-			})
-		}
-	}
+	h.syncCustomDomainIngress(ctx, appID, app, client, app.Port)
 
-	// Clean up old revisions (keep last 10)
+	// Clean up old revisions (keep last 10). This is also the invariant that
+	// autoRollback relies on — prior revision N-1 must exist when deploy N
+	// fails. Don't lower `keep` below 2 without updating autoRollback's guard.
 	h.db.DeleteOldRevisions(ctx, appID, 10)
+}
+
+// syncCustomDomainIngress reconciles the Ingress for an app's custom domain
+// (if one is configured) and updates the domain_status row on success.
+// Idempotent; called from both the forward deploy path and autoRollback.
+// Port is passed explicitly because the rolled-back revision may have a
+// different Port than the live app.Port (app fields aren't re-copied from
+// the revision on rollback).
+func (h *Handler) syncCustomDomainIngress(ctx context.Context, appID string, app *db.App, client *k8s.Client, port *int) {
+	if app.Domain == nil || *app.Domain == "" {
+		return
+	}
+	p := 80
+	if port != nil {
+		p = *port
+	}
+	if err := client.CreateOrUpdateIngress(app.Name, app.Namespace, *app.Domain, p); err != nil {
+		msg := "warning: failed to sync ingress: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "running", &msg)
+		return
+	}
+	activeStatus := "active"
+	h.db.UpdateAppDomain(ctx, db.UpdateAppDomainParams{
+		ID:           appID,
+		Domain:       app.Domain,
+		DomainStatus: &activeStatus,
+	})
 }
 
 // autoRollback is invoked when WatchRollout reports the new revision never
 // became healthy. It redeploys revision N-1 inline — same DeployApp path,
 // no watch on the rollback itself (v1). Called under the per-app deploy
-// mutex already held by deployApp.
+// mutex already held by deployApp, so the total worst-case time the mutex is
+// held is ~2 × progressDeadline (watch timeout + rollback deploy) plus
+// pre-deploy hook time — roughly 20–30 minutes upper bound. Concurrent
+// deploys on the same app queue behind it (intended).
 //
 // Revision-number math:
 //   - newRevision == 1 → nothing to roll back to; app stays "failed".
 //   - newRevision >  1 → rollback to N-1. On success, revision N is marked
 //     "rolled_back" and app's CurrentRevision is set to N-1. On failure,
 //     both errors are logged and app stays "failed".
+//
+// Known v1 gaps (tracked in ROADMAP Phase 2.11):
+//   - Server restart between UpdateAppStatus("verifying") and the terminal
+//     status leaves the row orphaned in "verifying" — no boot-time reconciler
+//     sweeps it.
+//   - Secrets are re-resolved from the live rows rather than snapshotted in
+//     the revision, so a rollback cannot recover a deploy broken by a deleted
+//     secret key that revision N-1's env references.
 func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, client *k8s.Client, newRevision int, deployErr error) {
 	origMsg := "rollout did not become ready: " + deployErr.Error()
 
@@ -696,15 +717,13 @@ func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, c
 		return
 	}
 
-	log.Printf("rollback: starting app=%s from=%d to=%d reason=%q", appID, newRevision, prior.RevisionNumber, deployErr.Error())
+	log.Printf("rollback: starting app=%s from=%d to=%d reason=%v", appID, newRevision, prior.RevisionNumber, deployErr)
 	h.db.UpdateAppStatus(ctx, appID, "rolling_back", &origMsg)
 
-	// Env vars + secret name come from the revision snapshot. Secrets
-	// themselves are stored outside the revision, so we re-sync from the
-	// live secret rows (same as the forward path). This matches the manual
-	// RollbackApp handler's behavior and means a rollback can recover a
-	// deployment broken by an env-var change, but cannot recover one broken
-	// by a newly-added secret (expected — secrets aren't versioned).
+	// Env vars come from the revision snapshot. Secret values aren't
+	// versioned — we re-resolve from live rows (matching the manual
+	// RollbackApp handler). A rollback can recover from an env-var regression
+	// but not from a deleted secret key that revision N-1's env references.
 	var envVars map[string]string
 	if len(prior.EnvVars) > 0 {
 		_ = json.Unmarshal(prior.EnvVars, &envVars)
@@ -726,6 +745,10 @@ func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, c
 	h.db.UpdateAppRevision(ctx, appID, prior.RevisionNumber)
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
 	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "rolled_back", &origMsg)
+
+	// Mirror the happy path: re-reconcile the custom-domain Ingress so it
+	// matches revision N-1's Port if that changed between N-1 and N.
+	h.syncCustomDomainIngress(ctx, appID, app, client, prior.Port)
 }
 
 func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {

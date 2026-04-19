@@ -24,13 +24,19 @@ package k8s
 //                           DeployApp also rejected by the API (simulated
 //                           via reactor). Both errors surface.
 //
-// What these do NOT cover (covered by code review + logs instead):
-//   - autoRollback's exact DB status string values (verifying / rolling_back
-//     / rolled_back / failed).
-//   - newRevision - 1 lookup path.
+// What these do NOT cover (tracked as follow-up: handler-level test harness):
+//   - app.status transitions verifying → running (happy) / rolling_back →
+//     running (rollback success) / rolling_back → failed (rollback fail).
+//   - revision N ends up "rolled_back" on rollback success vs "failed" on
+//     rollback failure.
+//   - app.CurrentRevision is set to N-1 after a successful rollback.
+//   - The newRevision <= 1 guard short-circuits before any rollback DeployApp.
+//   - GetSecretsByAppID re-resolution on rollback.
+//   - syncCustomDomainIngress re-runs on rollback with the prior.Port.
 // The rollback helper itself is thin glue that mirrors the forward path's
-// DeployApp + WatchRollout pair, so the high-value behavior is the k8s
-// interaction sequencing tested here.
+// DeployApp + WatchRollout pair, so the high-value k8s interaction sequencing
+// is tested here; the DB-side wiring is validated by code review and log
+// lines until the handler test seam lands.
 
 import (
 	"context"
@@ -139,8 +145,8 @@ func TestAutoRollback_WatchFails_RollbackSucceeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	watchErr := c.WatchRollout(ctx, "svc", "default")
-	if watchErr == nil || !errors.Is(watchErr, ErrRolloutFailed) {
-		t.Fatalf("expected ErrRolloutFailed, got %v", watchErr)
+	if watchErr == nil || !strings.HasPrefix(watchErr.Error(), "rollout failed:") {
+		t.Fatalf("expected rollout-failed error, got %v", watchErr)
 	}
 
 	// Simulate what autoRollback does: re-apply the prior revision spec.
@@ -172,8 +178,8 @@ func TestAutoRollback_FirstDeployFails_NoRollback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	watchErr := c.WatchRollout(ctx, "svc", "default")
-	if watchErr == nil || !errors.Is(watchErr, ErrRolloutFailed) {
-		t.Fatalf("expected ErrRolloutFailed, got %v", watchErr)
+	if watchErr == nil || !strings.HasPrefix(watchErr.Error(), "rollout failed:") {
+		t.Fatalf("expected rollout-failed error, got %v", watchErr)
 	}
 	// The k8s layer has no prior spec; autoRollback's N==1 guard (tested
 	// by code inspection) prevents any follow-up DeployApp. Here we assert

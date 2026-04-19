@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -11,18 +10,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ErrRolloutFailed is returned from WatchRollout when kube reports the
-// Deployment's Progressing condition as False with ProgressDeadlineExceeded.
-// Callers can use errors.Is to branch on "rollout failed fast" vs "watch
-// timed out waiting for readiness".
-var ErrRolloutFailed = errors.New("rollout failed")
-
 const defaultProgressDeadline = 600 * time.Second
 
 // WatchRollout polls the named Deployment every 2s until either:
 //   - all updated replicas are ready and available (returns nil)
 //   - the Progressing condition flips to False/ProgressDeadlineExceeded
-//     (returns an error wrapping ErrRolloutFailed)
+//     (returns an error with the kube-provided reason)
 //   - ctx is cancelled or deadlines (returns ctx.Err())
 //
 // We poll instead of using a watch because the fake clientset in tests does
@@ -35,9 +28,6 @@ func (c *Client) WatchRollout(ctx context.Context, name, namespace string) error
 	for {
 		dep, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			// ctx errors (cancel/deadline) surface here via the informer; treat
-			// any Get error as fatal for this watch — the deploy will re-enter
-			// on next invocation.
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -48,7 +38,7 @@ func (c *Client) WatchRollout(ctx context.Context, name, namespace string) error
 			return nil
 		}
 		if reason, failed := rolloutFailed(dep); failed {
-			return fmt.Errorf("%w: %s", ErrRolloutFailed, reason)
+			return fmt.Errorf("rollout failed: %s", reason)
 		}
 
 		select {
@@ -107,7 +97,9 @@ func progressDeadline(d *appsv1.Deployment) time.Duration {
 func (c *Client) DeploymentProgressDeadline(ctx context.Context, name, namespace string) time.Duration {
 	dep, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		log.Printf("rollout: progress deadline lookup failed app=%s ns=%s err=%v — using default %s", name, namespace, err, defaultProgressDeadline)
+		// Expected race on first-ever deploy (Create still in flight on slow
+		// etcd). Default is correct in that case; log at info only.
+		log.Printf("rollout: using default progress deadline %s for app=%s ns=%s (lookup: %v)", defaultProgressDeadline, name, namespace, err)
 		return defaultProgressDeadline
 	}
 	return progressDeadline(dep)

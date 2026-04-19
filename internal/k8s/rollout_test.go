@@ -100,8 +100,8 @@ func TestWatchRollout_ProgressDeadlineExceededFailsFast(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rollout-failed error, got nil")
 	}
-	if !errors.Is(err, ErrRolloutFailed) {
-		t.Errorf("expected ErrRolloutFailed, got %v", err)
+	if !strings.HasPrefix(err.Error(), "rollout failed:") {
+		t.Errorf("expected 'rollout failed:' prefix in err, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "pod stuck ImagePullBackOff") {
 		t.Errorf("expected condition message in err, got %v", err)

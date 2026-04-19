@@ -20,7 +20,7 @@ This document tracks planned features, development phases, implementation detail
 | Phase 2.8: Google SSO | ✅ Complete | 100% |
 | Phase 2.9: Default App URLs | ✅ Complete | 100% |
 | Phase 2.10: Design System & Dark Mode | 🟡 In Progress | 0% |
-| Phase 2.11: Zero-Downtime Deployment Defaults | 🟡 In Progress (P0) | ~30% |
+| Phase 2.11: Zero-Downtime Deployment Defaults | 🟡 In Progress (P0) | ~60% |
 | Phase 3: Porter Migration | 🟡 Planning | 0% |
 | Phase 4: Observability & Alerts | 🟡 Planning | 0% |
 | Phase 5: Branch Tracking & CI/CD Integration | 🔴 Planning (P0) | 0% |
@@ -173,9 +173,12 @@ Three tiers of smart-ness:
 - [x] **HPA wired into DeployApp** (commit 69de947): HPA reconciled on every deploy from the app record; MinReplicas clamped to ≥ 2 (logged WARN); preserves HPA-owned `Spec.Replicas` on Update to avoid fighting the controller; PDB `minAvailable` now uses `max(Replicas, HPAMin)` so HPA-scaled fleets get correct drain guarantees; SetAutoscaling handler writes DB before k8s so reconcileHPA converges on failure; deploy goroutine re-fetches app to avoid stale-snapshot races
 - [ ] **API / FE validation: min_replicas ≥ 2** — tighten `SetAutoscaling` to 400 on min < 2 and update FE default from 1 → 2, eliminating the UI↔cluster clamp divergence at the source (surfaced by elite-pr-review on 69de947)
 - [ ] **FE copy: static Replicas ignored while HPA enabled** — avoid user confusion when Replicas field edits appear to do nothing (surfaced by architect sign-off on 69de947)
-- [ ] **Per-app deploy mutex** — `sync.Map[appID]*sync.Mutex` around `deployApp()` entry to serialize overlapping deploys on the same app (race hazard grew once reconcileHPA runs every deploy)
-- [ ] **`rollingUpdateBudget` effective-fleet fix (P2)** — mirror the PDB's logic so HPA-scaled fleets get the right surge/unavailable budget. Today a deployment with `req.Replicas=3` + HPA scaled to 15 pods still gets `maxSurge=1, maxUnavailable=0` and rolls one pod at a time (slow but safe). Fix: compute `effective = max(req.Replicas, HPAMinReplicas when enabled, existing.Status.Replicas)` and feed that into `rollingUpdateBudget`. Greptile flagged this on PR #4 (comment 3106138480); current code is safe, only perf impact (~minutes added to large-fleet rollouts)
-- [ ] **Auto-rollback**: watch rollout; if new ReplicaSet fails to become Available within `progressDeadlineSeconds`, trigger `kubectl rollout undo` + mark deploy failed + Slack alert
+- [x] **Per-app deploy mutex** (PR #6): `sync.Map[appID]*sync.Mutex` on `Handler`; `deployApp()` locks at entry before DB re-fetch; cleaned up in `DeleteApp`.
+- [x] **`rollingUpdateBudget` effective-fleet fix** (PR #6): `effectiveFleet(req, existing) = max(req.Replicas, HPAMinReplicas when enabled, existing.Status.Replicas)` now drives both the rolling budget and the PDB floor (consistency with Greptile's suggestion on PR #4).
+- [x] **Auto-rollback on failed rollout**: `WatchRollout` polls Deployment readiness (2s interval, fast-fail on `ProgressDeadlineExceeded`) after every DeployApp. On failure, `deployApp` loads revision N-1 from DB and redeploys inline. New statuses: `verifying`, `rolling_back`, `rolled_back`. No DB migration. Slack alert deferred to Phase 4.
+- [ ] **Orphaned-`verifying` recovery**: server restart between `UpdateAppStatus("verifying")` and the terminal status write leaves the row stuck. Boot-time sweeper should fetch all `(verifying|rolling_back|running_predeploy)` apps, check `rolloutReady`/`rolloutFailed` once synchronously, and reconcile the DB against live cluster state. Surfaced by elite-pr-review on the auto-rollback PR.
+- [ ] **Snapshot secret *key names* in `app_revisions`**: secret values stay out of the DB, but the list of keys should be versioned so rollback can detect when revision N-1's env references a secret deleted between N-1 and N, and fail fast instead of deploying an env-var-missing pod. Surfaced by elite-pr-review on the auto-rollback PR.
+- [ ] **Handler-level test harness**: auto-rollback's DB status transitions (`verifying` → `rolling_back` → `rolled_back`, `CurrentRevision = N-1`) are validated by code review + logs only today. Either a small `db.DB` interface extraction or a pg-test-container harness would unlock outermost-layer tests for `deployApp`.
 - [ ] **App creation validation**: reject creation if `health_path` or `resource_*` missing (API 400 with clear remediation message)
 - [ ] **Health endpoint enforcement**: during deploy, after rollout completes, curl the `health_path` through the service → must return 2xx before marking deploy "successful"
 - [ ] **DB schema**: add `max_request_duration_seconds` (int), `startup_p99_ms` (int, auto-populated)
