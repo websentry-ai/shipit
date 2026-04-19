@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -562,28 +563,11 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	json.Unmarshal(app.EnvVars, &envVars)
 
 	// Sync secrets to K8s
-	secretName := ""
-	secrets, err := h.db.GetSecretsByAppID(ctx, appID)
-	if err == nil && len(secrets) > 0 {
-		secretData := make(map[string]string)
-		for _, s := range secrets {
-			// Decrypt secret value
-			decrypted, err := auth.Decrypt(s.ValueEncrypted, h.encryptKey)
-			if err != nil {
-				msg := "failed to decrypt secret: " + err.Error()
-				h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
-				return
-			}
-			secretData[s.Key] = string(decrypted)
-		}
-
-		// Create/update K8s Secret
-		secretName = app.Name + "-secrets"
-		if err := client.CreateOrUpdateSecret(secretName, app.Namespace, secretData); err != nil {
-			msg := "failed to create k8s secret: " + err.Error()
-			h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
-			return
-		}
+	secretName, secretErr := h.syncSecretsToCluster(ctx, app, client)
+	if secretErr != nil {
+		msg := secretErr.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		return
 	}
 
 	// Run pre-deploy hook if configured
@@ -648,6 +632,32 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	// autoRollback relies on — prior revision N-1 must exist when deploy N
 	// fails. Don't lower `keep` below 2 without updating autoRollback's guard.
 	h.db.DeleteOldRevisions(ctx, appID, 10)
+}
+
+// syncSecretsToCluster decrypts the app's secrets from DB and writes them to
+// the cluster Secret object. Returns the secret name (empty if no secrets).
+// Called from both the forward deploy path and autoRollback so the cluster
+// Secret always reflects current DB state — critical during rollback because
+// secrets aren't versioned in revisions; a rotation during the watch window
+// needs to land in the cluster before the rollback pods start.
+func (h *Handler) syncSecretsToCluster(ctx context.Context, app *db.App, client *k8s.Client) (string, error) {
+	secrets, err := h.db.GetSecretsByAppID(ctx, app.ID)
+	if err != nil || len(secrets) == 0 {
+		return "", nil
+	}
+	secretData := make(map[string]string)
+	for _, s := range secrets {
+		decrypted, err := auth.Decrypt(s.ValueEncrypted, h.encryptKey)
+		if err != nil {
+			return "", fmt.Errorf("failed to decrypt secret: %w", err)
+		}
+		secretData[s.Key] = string(decrypted)
+	}
+	secretName := app.Name + "-secrets"
+	if err := client.CreateOrUpdateSecret(secretName, app.Namespace, secretData); err != nil {
+		return "", fmt.Errorf("failed to create k8s secret: %w", err)
+	}
+	return secretName, nil
 }
 
 // syncCustomDomainIngress reconciles the Ingress for an app's custom domain
@@ -721,16 +731,21 @@ func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, c
 	h.db.UpdateAppStatus(ctx, appID, "rolling_back", &origMsg)
 
 	// Env vars come from the revision snapshot. Secret values aren't
-	// versioned — we re-resolve from live rows (matching the manual
-	// RollbackApp handler). A rollback can recover from an env-var regression
-	// but not from a deleted secret key that revision N-1's env references.
+	// versioned — re-sync the cluster Secret from current DB state (matches
+	// the forward path and handles the case where secrets rotated during the
+	// watch window). A rollback can recover from an env-var regression but
+	// not from a deleted secret key that revision N-1's env references.
 	var envVars map[string]string
 	if len(prior.EnvVars) > 0 {
 		_ = json.Unmarshal(prior.EnvVars, &envVars)
 	}
-	secretName := ""
-	if secrets, _ := h.db.GetSecretsByAppID(ctx, appID); len(secrets) > 0 {
-		secretName = app.Name + "-secrets"
+	secretName, err := h.syncSecretsToCluster(ctx, app, client)
+	if err != nil {
+		log.Printf("rollback: secret sync failed app=%s err=%v original_err=%v", appID, err, deployErr)
+		msg := origMsg + " | rollback secret sync failed: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
 	}
 
 	if err := client.DeployApp(buildDeployRequestFromRevision(app, prior, h.appBaseDomain, secretName, envVars)); err != nil {

@@ -52,6 +52,13 @@ func (c *Client) WatchRollout(ctx context.Context, name, namespace string) error
 // rolloutReady mirrors `kubectl rollout status`: new ReplicaSet has been
 // observed by the controller and every desired replica is updated, ready,
 // and available.
+//
+// Edge case — a Deployment scaled to 0 replicas is trivially ready once the
+// controller has observed the generation: there are no pods to wait for.
+// This matches kube semantics and `kubectl rollout status` behavior. If
+// shipit ever allows a user to create an app at replicas=0, the deploy will
+// be reported as `running` immediately — which is correct: the declared
+// state ("zero pods") has been fully realised.
 func rolloutReady(d *appsv1.Deployment) bool {
 	if d.Spec.Replicas == nil {
 		return false
