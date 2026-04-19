@@ -612,34 +612,7 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		}
 	}
 
-	err = client.DeployApp(k8s.DeployRequest{
-		Name:       app.Name,
-		Namespace:  app.Namespace,
-		Image:      app.Image,
-		Replicas:   int32(app.Replicas),
-		Port:       app.Port,
-		EnvVars:    envVars,
-		SecretName: secretName,
-		// Resource limits
-		CPURequest:    app.CPURequest,
-		CPULimit:      app.CPULimit,
-		MemoryRequest: app.MemoryRequest,
-		MemoryLimit:   app.MemoryLimit,
-		// Health check
-		HealthPath:         app.HealthPath,
-		HealthPort:         app.HealthPort,
-		HealthInitialDelay: app.HealthInitialDelay,
-		HealthPeriod:       app.HealthPeriod,
-		// HPA — reconciled every deploy from the app record so the cluster
-		// tracks UI/DB state; disabling removes the HPA cleanly.
-		HPAEnabled:      app.HPAEnabled,
-		HPAMinReplicas:  intPtrToInt32Ptr(app.MinReplicas),
-		HPAMaxReplicas:  intPtrToInt32Ptr(app.MaxReplicas),
-		HPATargetCPU:    intPtrToInt32Ptr(app.CPUTarget),
-		HPATargetMemory: intPtrToInt32Ptr(app.MemoryTarget),
-		// Default app URL
-		BaseDomain: h.appBaseDomain,
-	})
+	err = client.DeployApp(buildDeployRequestFromApp(app, h.appBaseDomain, secretName, envVars))
 	if err != nil {
 		msg := err.Error()
 		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
