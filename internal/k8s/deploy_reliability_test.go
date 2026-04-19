@@ -2,11 +2,16 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestImagePullPolicyFor(t *testing.T) {
@@ -470,5 +475,117 @@ func TestEnsurePodDisruptionBudget_IdempotentUpdate(t *testing.T) {
 	pdb, _ := c.clientset.PolicyV1().PodDisruptionBudgets("default").Get(ctx, "svc", metav1.GetOptions{})
 	if pdb.Spec.MinAvailable.IntValue() != 4 {
 		t.Errorf("want minAvailable=4 after scale-up, got %v", pdb.Spec.MinAvailable)
+	}
+}
+
+func TestEffectiveFleet(t *testing.T) {
+	cases := []struct {
+		name          string
+		replicas      int32
+		hpaEnabled    bool
+		hpaMin        *int32
+		existingCount int32 // status.replicas on existing deployment; -1 = no existing
+		want          int32
+	}{
+		{"new deploy, no HPA", 3, false, nil, -1, 3},
+		{"new deploy, HPA min > static", 3, true, i32Ptr(5), -1, 5},
+		{"new deploy, HPA min < static", 5, true, i32Ptr(2), -1, 5},
+		{"existing scaled above static, no HPA", 3, false, nil, 8, 8},
+		{"existing scaled above HPA min", 3, true, i32Ptr(5), 12, 12},
+		{"existing below all floors", 5, true, i32Ptr(3), 2, 5},
+		{"nil HPAMin while HPA enabled is tolerated", 4, true, nil, -1, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := DeployRequest{Replicas: tc.replicas, HPAEnabled: tc.hpaEnabled, HPAMinReplicas: tc.hpaMin}
+			var existing *appsv1.Deployment
+			if tc.existingCount >= 0 {
+				existing = &appsv1.Deployment{Status: appsv1.DeploymentStatus{Replicas: tc.existingCount}}
+			}
+			if got := effectiveFleet(req, existing); got != tc.want {
+				t.Errorf("effectiveFleet = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// Regression guard for the Greptile P2 feedback on PR #4: an HPA-scaled fleet
+// should get the larger rolling budget, not the small-fleet 1-at-a-time budget.
+func TestDeployApp_RollingUpdateBudgetReflectsHPAScaledFleet(t *testing.T) {
+	c := newTestClient()
+	port := 8080
+	minR := int32(2)
+	maxR := int32(30)
+
+	// Initial deploy with static Replicas=3 → small-fleet budget.
+	if err := c.DeployApp(DeployRequest{
+		Name:           "svc",
+		Namespace:      "default",
+		Image:          "r/app:v1",
+		Replicas:       3,
+		Port:           &port,
+		HPAEnabled:     true,
+		HPAMinReplicas: &minR,
+		HPAMaxReplicas: &maxR,
+	}); err != nil {
+		t.Fatalf("initial deploy: %v", err)
+	}
+	// Simulate HPA scaling the deployment up to 15 running pods.
+	ctx := context.Background()
+	dep, _ := c.clientset.AppsV1().Deployments("default").Get(ctx, "svc", metav1.GetOptions{})
+	scaled := int32(15)
+	dep.Spec.Replicas = &scaled
+	dep.Status.Replicas = 15
+	if _, err := c.clientset.AppsV1().Deployments("default").Update(ctx, dep, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("simulate scale: %v", err)
+	}
+	// Redeploy. The rolling budget should now reflect a 15-pod fleet, not the
+	// static 3. Small-fleet budget is int-typed (1/0); large-fleet is string-
+	// typed (25%/25%). Asserting the type distinguishes.
+	if err := c.DeployApp(DeployRequest{
+		Name:           "svc",
+		Namespace:      "default",
+		Image:          "r/app:v2",
+		Replicas:       3,
+		Port:           &port,
+		HPAEnabled:     true,
+		HPAMinReplicas: &minR,
+		HPAMaxReplicas: &maxR,
+	}); err != nil {
+		t.Fatalf("redeploy: %v", err)
+	}
+	after, _ := c.clientset.AppsV1().Deployments("default").Get(ctx, "svc", metav1.GetOptions{})
+	ru := after.Spec.Strategy.RollingUpdate
+	if ru == nil {
+		t.Fatal("expected RollingUpdate strategy")
+	}
+	if ru.MaxSurge == nil || ru.MaxSurge.Type != intstr.String {
+		t.Errorf("expected percent-based maxSurge for 15-pod fleet, got %+v", ru.MaxSurge)
+	}
+	if ru.MaxUnavailable == nil || ru.MaxUnavailable.Type != intstr.String {
+		t.Errorf("expected percent-based maxUnavailable for 15-pod fleet, got %+v", ru.MaxUnavailable)
+	}
+}
+
+func i32Ptr(v int32) *int32 { return &v }
+
+// If Get returns a non-NotFound error (permission denied, API server down),
+// DeployApp must surface it — NOT silently fall through to Create, which
+// would just fail again with a worse error message.
+func TestDeployApp_NonNotFoundGetErrorSurfaces(t *testing.T) {
+	c := newTestClient()
+	c.clientset.(*fake.Clientset).PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("forbidden")
+	})
+	port := 8080
+	err := c.DeployApp(DeployRequest{
+		Name:      "svc",
+		Namespace: "default",
+		Image:     "r/app:v1",
+		Replicas:  2,
+		Port:      &port,
+	})
+	if err == nil {
+		t.Fatal("expected error from non-NotFound Get, got nil")
 	}
 }

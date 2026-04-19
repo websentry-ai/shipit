@@ -302,12 +302,28 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		}
 	}
 
-	maxSurge, maxUnavailable := rollingUpdateBudget(req.Replicas)
+	deploymentsClient := c.clientset.AppsV1().Deployments(req.Namespace)
+
+	// Fetch first so both the rolling-update budget and the HPA replica-
+	// preservation logic see the same, current cluster state. apierrors.IsNotFound
+	// marks this as a Create; any other error is fatal (e.g. permission denied —
+	// silently treating it as Create would stomp an unknown-state object).
+	existing, getErr := deploymentsClient.Get(ctx, req.Name, metav1.GetOptions{})
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		return fmt.Errorf("failed to get existing deployment: %w", getErr)
+	}
+
+	// Rolling-update budget should reflect the deployment's *actual* fleet size,
+	// not just req.Replicas. For HPA-scaled apps, Status.Replicas is the number
+	// of pods the controller will be cycling through; computing the budget from
+	// req.Replicas=3 on a 15-pod fleet means 1-pod-at-a-time rollouts even
+	// though 25%/25% would be safe and ~4× faster. Mirrors the PDB's effective-
+	// fleet logic for consistency (see ensurePodDisruptionBudget).
+	maxSurge, maxUnavailable := rollingUpdateBudget(effectiveFleet(req, existing))
 	terminationGrace := int64(30)
 	progressDeadline := int32(600)
 	historyLimit := int32(10)
 
-	// Create or update deployment
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      req.Name,
@@ -341,14 +357,8 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		},
 	}
 
-	deploymentsClient := c.clientset.AppsV1().Deployments(req.Namespace)
-
-	// Try to get existing deployment
-	existing, err := deploymentsClient.Get(ctx, req.Name, metav1.GetOptions{})
-	if err != nil {
-		// Create new deployment
-		_, err = deploymentsClient.Create(ctx, deployment, metav1.CreateOptions{})
-		if err != nil {
+	if apierrors.IsNotFound(getErr) {
+		if _, err := deploymentsClient.Create(ctx, deployment, metav1.CreateOptions{}); err != nil {
 			return fmt.Errorf("failed to create deployment: %w", err)
 		}
 	} else {
@@ -360,8 +370,7 @@ func (c *Client) DeployApp(req DeployRequest) error {
 			deployment.Spec.Replicas = existing.Spec.Replicas
 		}
 		deployment.ResourceVersion = existing.ResourceVersion
-		_, err = deploymentsClient.Update(ctx, deployment, metav1.UpdateOptions{})
-		if err != nil {
+		if _, err := deploymentsClient.Update(ctx, deployment, metav1.UpdateOptions{}); err != nil {
 			return fmt.Errorf("failed to update deployment: %w", err)
 		}
 	}
@@ -454,6 +463,27 @@ func rollingUpdateBudget(replicas int32) (intstr.IntOrString, intstr.IntOrString
 		return intstr.FromInt(1), intstr.FromInt(0)
 	}
 	return intstr.FromString("25%"), intstr.FromString("25%")
+}
+
+// effectiveFleet is the replica count both the rolling-update budget and the
+// PDB should reason about. It takes the max of:
+//   - req.Replicas (the static DB value — floor for a brand-new deploy)
+//   - HPAMinReplicas (planned floor when HPA owns scaling)
+//   - existing.Status.Replicas (actual live pod count — catches apps running
+//     well above HPAMin right now)
+//
+// Without this, a 15-pod HPA-scaled fleet with req.Replicas=3 would roll one
+// pod at a time during a deploy even though 25%/25% is safe, because
+// rollingUpdateBudget was looking at the static 3.
+func effectiveFleet(req DeployRequest, existing *appsv1.Deployment) int32 {
+	n := req.Replicas
+	if req.HPAEnabled && req.HPAMinReplicas != nil && *req.HPAMinReplicas > n {
+		n = *req.HPAMinReplicas
+	}
+	if existing != nil && existing.Status.Replicas > n {
+		n = existing.Status.Replicas
+	}
+	return n
 }
 
 // imagePullPolicyFor returns IfNotPresent for immutable tags (the expected
