@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go test + vet + build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # internal/web/embed.go has `//go:embed all:dist` which fails when the
+      # dist directory is absent. We don't build the frontend in this job —
+      # that's a separate concern. A single stub file satisfies the embed
+      # directive and lets `go build`/`vet`/`test` run against everything
+      # under internal/ without pulling in the node toolchain.
+      - name: Stub frontend embed
+        run: mkdir -p internal/web/dist && touch internal/web/dist/index.html
+
+      - name: go vet
+        run: go vet ./internal/...
+
+      - name: go build
+        run: go build ./internal/...
+
+      # -race catches concurrency bugs (the per-app deploy mutex is an
+      # obvious surface); -count=1 disables the test cache so flakes surface
+      # on every run.
+      - name: go test
+        run: go test -race -count=1 ./internal/...
