@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,6 +25,15 @@ type Handler struct {
 	encryptKey      string
 	appBaseDomain   string // e.g., "apps.shipit.unboundsec.dev"
 	porterDiscovery *porter.DiscoveryService
+
+	// deployLocks serializes concurrent deploys of the same app. Two overlapping
+	// deployApp goroutines would race on the Deployment spec (replicas, image)
+	// and on the HPA (reconciled on every deploy now). sync.Map lets us allocate
+	// a mutex per-appID lazily without a global lock. Blocking (not rejecting)
+	// is deliberate: the HTTP handler has already returned 202, so the caller's
+	// intent is preserved and the second deploy will converge on the final
+	// state once the first finishes.
+	deployLocks sync.Map // map[string]*sync.Mutex
 }
 
 func NewHandler(database *db.DB, encryptKey, appBaseDomain string, porterDiscovery *porter.DiscoveryService) *Handler {
@@ -32,6 +43,31 @@ func NewHandler(database *db.DB, encryptKey, appBaseDomain string, porterDiscove
 		appBaseDomain:   appBaseDomain,
 		porterDiscovery: porterDiscovery,
 	}
+}
+
+// lockAppDeploy returns an unlock function that must be called when the
+// deploy goroutine is done. Blocks until any in-flight deploy for the same
+// app has finished.
+//
+// Lock is held for the full deployApp duration including RunPreDeployJob,
+// which can take minutes for migrations. A waiting caller's 202 has already
+// been returned, so blocking preserves user intent; the log line below lets
+// ops see queueing in logs when a deploy stacks up behind a long pre-deploy
+// hook.
+func (h *Handler) lockAppDeploy(appID string) func() {
+	m, _ := h.deployLocks.LoadOrStore(appID, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	if !tryLock(mu) {
+		log.Printf("deploy: waiting for in-flight deploy on app=%s", appID)
+		mu.Lock()
+	}
+	return mu.Unlock
+}
+
+// tryLock is a best-effort non-blocking Lock. Used only for the logging
+// fast-path above; correctness does not depend on it.
+func tryLock(mu *sync.Mutex) bool {
+	return mu.TryLock()
 }
 
 // Health check
@@ -461,6 +497,13 @@ func (h *Handler) DeployApp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
+	// Serialize concurrent deploys on the same app. Without this, two goroutines
+	// would race on Deployment spec (replicas, image) and on the HPA (reconciled
+	// on every deploy). Lock is acquired BEFORE the DB re-fetch so the second
+	// goroutine reads fresh state after the first one's writes have landed.
+	unlock := h.lockAppDeploy(appID)
+	defer unlock()
+
 	ctx := context.Background()
 	client, err := k8s.NewClient(kubeconfig)
 	if err != nil {
@@ -667,6 +710,9 @@ func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {
 		httpError(w, "failed to delete app", http.StatusInternalServerError)
 		return
 	}
+	// Drop the per-app deploy mutex so deployLocks doesn't accumulate
+	// entries for deleted apps over the process lifetime.
+	h.deployLocks.Delete(appID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
