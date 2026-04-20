@@ -403,6 +403,21 @@ func (db *DB) GetLatestRevision(ctx context.Context, appID string) (*AppRevision
 	return &r, err
 }
 
+// GetNextRevisionNumber returns MAX(revision_number)+1 for the given app, or
+// 1 if the app has no revisions yet. Used instead of app.CurrentRevision+1
+// because CurrentRevision tracks the last SUCCESSFUL deploy — after an
+// auto-rollback, CurrentRevision regresses to the prior success, so adding
+// one would collide with the rolled_back revision that still exists under
+// the UNIQUE(app_id, revision_number) constraint.
+func (db *DB) GetNextRevisionNumber(ctx context.Context, appID string) (int, error) {
+	var n int
+	err := db.GetContext(ctx, &n, `
+		SELECT COALESCE(MAX(revision_number), 0) + 1
+		FROM app_revisions WHERE app_id = $1
+	`, appID)
+	return n, err
+}
+
 func (db *DB) UpdateAppRevision(ctx context.Context, appID string, revision int) error {
 	_, err := db.ExecContext(ctx, `
 		UPDATE apps SET current_revision = $1, updated_at = NOW() WHERE id = $2

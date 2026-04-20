@@ -521,8 +521,17 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		app = fresh
 	}
 
-	// Create a revision snapshot before deploying
-	newRevision := app.CurrentRevision + 1
+	// Allocate the next revision number via MAX+1, NOT CurrentRevision+1.
+	// CurrentRevision tracks the last successful deploy; after an auto-
+	// rollback it regresses to the prior success, so CurrentRevision+1
+	// collides with the rolled_back revision that still exists under the
+	// UNIQUE(app_id, revision_number) constraint. MAX+1 is collision-free.
+	newRevision, nextErr := h.db.GetNextRevisionNumber(ctx, appID)
+	if nextErr != nil {
+		msg := "failed to allocate revision number: " + nextErr.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		return
+	}
 	cpuReq := app.CPURequest
 	cpuLim := app.CPULimit
 	memReq := app.MemoryRequest
@@ -688,18 +697,22 @@ func (h *Handler) syncCustomDomainIngress(ctx context.Context, appID string, app
 }
 
 // autoRollback is invoked when WatchRollout reports the new revision never
-// became healthy. It redeploys revision N-1 inline — same DeployApp path,
-// no watch on the rollback itself (v1). Called under the per-app deploy
-// mutex already held by deployApp, so the total worst-case time the mutex is
-// held is ~2 × progressDeadline (watch timeout + rollback deploy) plus
-// pre-deploy hook time — roughly 20–30 minutes upper bound. Concurrent
-// deploys on the same app queue behind it (intended).
+// became healthy. It redeploys the app's last successful revision
+// (app.CurrentRevision) inline — same DeployApp path, no watch on the
+// rollback itself (v1). Called under the per-app deploy mutex already held
+// by deployApp, so the total worst-case time the mutex is held is ~2 ×
+// progressDeadline plus pre-deploy hook time — roughly 20–30 minutes upper
+// bound. Concurrent deploys on the same app queue behind it (intended).
 //
-// Revision-number math:
-//   - newRevision == 1 → nothing to roll back to; app stays "failed".
-//   - newRevision >  1 → rollback to N-1. On success, revision N is marked
-//     "rolled_back" and app's CurrentRevision is set to N-1. On failure,
-//     both errors are logged and app stays "failed".
+// Rollback-target selection:
+//   - app.CurrentRevision == 0 → no prior successful deploy; app stays
+//     "failed". (Happens on a first-ever-deploy failure.)
+//   - otherwise → rollback to app.CurrentRevision. On success, revision N
+//     (the failed forward) is marked "rolled_back" and app.CurrentRevision
+//     is left unchanged (it already points at the successful target).
+//     Critically we do NOT target newRevision-1 — with MAX+1 allocation,
+//     newRevision-1 can be a previously-rolled-back revision from an earlier
+//     incident, which would be the wrong thing to redeploy.
 //
 // Known v1 gaps (tracked in ROADMAP Phase 2.11):
 //   - Server restart between UpdateAppStatus("verifying") and the terminal
@@ -707,21 +720,21 @@ func (h *Handler) syncCustomDomainIngress(ctx context.Context, appID string, app
 //     sweeps it.
 //   - Secrets are re-resolved from the live rows rather than snapshotted in
 //     the revision, so a rollback cannot recover a deploy broken by a deleted
-//     secret key that revision N-1's env references.
+//     secret key that the prior revision's env references.
 func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, client *k8s.Client, newRevision int, deployErr error) {
 	origMsg := "rollout did not become ready: " + deployErr.Error()
 
-	if newRevision <= 1 {
+	if app.CurrentRevision <= 0 {
 		log.Printf("rollback: first-deploy-cannot-rollback app=%s revision=%d", appID, newRevision)
 		h.db.UpdateAppStatus(ctx, appID, "failed", &origMsg)
 		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &origMsg)
 		return
 	}
 
-	prior, err := h.db.GetRevision(ctx, appID, newRevision-1)
+	prior, err := h.db.GetRevision(ctx, appID, app.CurrentRevision)
 	if err != nil {
-		log.Printf("rollback: prior-revision-missing app=%s revision=%d err=%v", appID, newRevision-1, err)
-		msg := origMsg + " | rollback aborted: prior revision " + strconv.Itoa(newRevision-1) + " not found: " + err.Error()
+		log.Printf("rollback: prior-revision-missing app=%s target_revision=%d err=%v", appID, app.CurrentRevision, err)
+		msg := origMsg + " | rollback aborted: prior revision " + strconv.Itoa(app.CurrentRevision) + " not found: " + err.Error()
 		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
 		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
 		return
@@ -757,7 +770,10 @@ func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, c
 	}
 
 	log.Printf("rollback: succeeded app=%s target_revision=%d", appID, prior.RevisionNumber)
-	h.db.UpdateAppRevision(ctx, appID, prior.RevisionNumber)
+	// app.CurrentRevision already equals prior.RevisionNumber (that's how we
+	// selected the rollback target above), so no UpdateAppRevision call is
+	// needed. Subsequent deploys will allocate their revision number via
+	// GetNextRevisionNumber (MAX+1), which is collision-free regardless.
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
 	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "rolled_back", &origMsg)
 
@@ -1014,8 +1030,17 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 	// Update status to deploying
 	h.db.UpdateAppStatus(r.Context(), appID, "rolling_back", nil)
 
-	// Re-fetch app with updated config and deploy
-	updatedApp, _ := h.db.GetApp(r.Context(), appID)
+	// Re-fetch app with the UpdateApp changes from above applied. If the
+	// re-fetch fails we fall back to the pre-update `app`: stale by one
+	// field-copy but still a valid pointer, and deployApp's own in-goroutine
+	// GetApp will try again. Without this guard, a failing GetApp would
+	// pass a nil pointer to deployApp, which would nil-deref on the first
+	// field access (e.g. app.CurrentRevision).
+	updatedApp, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		log.Printf("rollback: app re-fetch failed — falling back to pre-update snapshot app=%s err=%v", appID, err)
+		updatedApp = app
+	}
 	go h.deployApp(appID, updatedApp, kubeconfig)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
