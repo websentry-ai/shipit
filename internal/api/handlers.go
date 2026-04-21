@@ -964,14 +964,17 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Rollback to previous revision (current - 1)
+		// Rollback to the last *successful* revision before CurrentRevision.
+		// CurrentRevision-1 is unsafe: MAX+1 allocation can leave gaps where
+		// the intervening numbers are rolled_back or failed revisions. We
+		// must skip those to find the previous known-good deploy.
 		if app.CurrentRevision <= 1 {
 			httpError(w, "no previous revision to rollback to", http.StatusBadRequest)
 			return
 		}
-		targetRevision, err = h.db.GetRevision(r.Context(), appID, app.CurrentRevision-1)
+		targetRevision, err = h.db.GetLastSuccessfulRevisionBefore(r.Context(), appID, app.CurrentRevision)
 		if err != nil {
-			httpError(w, "previous revision not found", http.StatusNotFound)
+			httpError(w, "no previous successful revision to rollback to", http.StatusNotFound)
 			return
 		}
 	}
@@ -1010,6 +1013,15 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		httpError(w, "failed to update app configuration", http.StatusInternalServerError)
+		return
+	}
+
+	// CurrentRevision must point at the target BEFORE deployApp runs. If we
+	// leave it at the broken revision, a subsequent watch-timeout would
+	// invoke autoRollback, which reads app.CurrentRevision as the rollback
+	// target — and redeploys the very revision the user was escaping from.
+	if err := h.db.UpdateAppRevision(r.Context(), appID, targetRevision.RevisionNumber); err != nil {
+		httpError(w, "failed to update current revision", http.StatusInternalServerError)
 		return
 	}
 

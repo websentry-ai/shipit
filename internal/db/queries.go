@@ -418,6 +418,26 @@ func (db *DB) GetNextRevisionNumber(ctx context.Context, appID string) (int, err
 	return n, err
 }
 
+// GetLastSuccessfulRevisionBefore returns the highest revision_number with
+// deploy_status='success' strictly below `below`. Used by the default
+// RollbackApp path: with MAX+1 allocation, CurrentRevision-1 can be a
+// rolled_back/failed revision from a prior incident — rolling back to it
+// would redeploy broken code. This query skips those and finds the last
+// actually-good revision.
+//
+// Returns sql.ErrNoRows if no prior success exists (caller should treat as
+// "nothing to roll back to").
+func (db *DB) GetLastSuccessfulRevisionBefore(ctx context.Context, appID string, below int) (*AppRevision, error) {
+	var r AppRevision
+	err := db.GetContext(ctx, &r, `
+		SELECT * FROM app_revisions
+		WHERE app_id = $1 AND revision_number < $2 AND deploy_status = 'success'
+		ORDER BY revision_number DESC
+		LIMIT 1
+	`, appID, below)
+	return &r, err
+}
+
 func (db *DB) UpdateAppRevision(ctx context.Context, appID string, revision int) error {
 	_, err := db.ExecContext(ctx, `
 		UPDATE apps SET current_revision = $1, updated_at = NOW() WHERE id = $2
