@@ -1042,12 +1042,18 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 	// Update status to deploying
 	h.db.UpdateAppStatus(r.Context(), appID, "rolling_back", nil)
 
+	// Belt-and-suspenders for C1: even if both this re-fetch AND deployApp's
+	// in-goroutine re-fetch fail (narrow DB-outage window), the snapshot
+	// we hand to deployApp must carry the new CurrentRevision. Otherwise
+	// autoRollback would target the broken revision the user is escaping.
+	app.CurrentRevision = targetRevision.RevisionNumber
+
 	// Re-fetch app with the UpdateApp changes from above applied. If the
-	// re-fetch fails we fall back to the pre-update `app`: stale by one
-	// field-copy but still a valid pointer, and deployApp's own in-goroutine
-	// GetApp will try again. Without this guard, a failing GetApp would
-	// pass a nil pointer to deployApp, which would nil-deref on the first
-	// field access (e.g. app.CurrentRevision).
+	// re-fetch fails we fall back to the pre-update `app` (with the
+	// in-memory CurrentRevision fix above): stale by one field-copy but
+	// still a valid pointer, and deployApp's own in-goroutine GetApp will
+	// try again. Without this guard, a failing GetApp would pass a nil
+	// pointer to deployApp.
 	updatedApp, err := h.db.GetApp(r.Context(), appID)
 	if err != nil {
 		log.Printf("rollback: app re-fetch failed — falling back to pre-update snapshot app=%s err=%v", appID, err)

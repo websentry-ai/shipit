@@ -426,7 +426,8 @@ func (db *DB) GetNextRevisionNumber(ctx context.Context, appID string) (int, err
 // actually-good revision.
 //
 // Returns sql.ErrNoRows if no prior success exists (caller should treat as
-// "nothing to roll back to").
+// "nothing to roll back to"). On error the returned pointer is non-nil but
+// references a zero-valued struct — check err before dereferencing.
 func (db *DB) GetLastSuccessfulRevisionBefore(ctx context.Context, appID string, below int) (*AppRevision, error) {
 	var r AppRevision
 	err := db.GetContext(ctx, &r, `
