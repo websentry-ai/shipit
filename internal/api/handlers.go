@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -520,8 +521,17 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		app = fresh
 	}
 
-	// Create a revision snapshot before deploying
-	newRevision := app.CurrentRevision + 1
+	// Allocate the next revision number via MAX+1, NOT CurrentRevision+1.
+	// CurrentRevision tracks the last successful deploy; after an auto-
+	// rollback it regresses to the prior success, so CurrentRevision+1
+	// collides with the rolled_back revision that still exists under the
+	// UNIQUE(app_id, revision_number) constraint. MAX+1 is collision-free.
+	newRevision, nextErr := h.db.GetNextRevisionNumber(ctx, appID)
+	if nextErr != nil {
+		msg := "failed to allocate revision number: " + nextErr.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		return
+	}
 	cpuReq := app.CPURequest
 	cpuLim := app.CPULimit
 	memReq := app.MemoryRequest
@@ -562,28 +572,11 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	json.Unmarshal(app.EnvVars, &envVars)
 
 	// Sync secrets to K8s
-	secretName := ""
-	secrets, err := h.db.GetSecretsByAppID(ctx, appID)
-	if err == nil && len(secrets) > 0 {
-		secretData := make(map[string]string)
-		for _, s := range secrets {
-			// Decrypt secret value
-			decrypted, err := auth.Decrypt(s.ValueEncrypted, h.encryptKey)
-			if err != nil {
-				msg := "failed to decrypt secret: " + err.Error()
-				h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
-				return
-			}
-			secretData[s.Key] = string(decrypted)
-		}
-
-		// Create/update K8s Secret
-		secretName = app.Name + "-secrets"
-		if err := client.CreateOrUpdateSecret(secretName, app.Namespace, secretData); err != nil {
-			msg := "failed to create k8s secret: " + err.Error()
-			h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
-			return
-		}
+	secretName, secretErr := h.syncSecretsToCluster(ctx, app, client)
+	if secretErr != nil {
+		msg := secretErr.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		return
 	}
 
 	// Run pre-deploy hook if configured
@@ -612,39 +605,27 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		}
 	}
 
-	err = client.DeployApp(k8s.DeployRequest{
-		Name:       app.Name,
-		Namespace:  app.Namespace,
-		Image:      app.Image,
-		Replicas:   int32(app.Replicas),
-		Port:       app.Port,
-		EnvVars:    envVars,
-		SecretName: secretName,
-		// Resource limits
-		CPURequest:    app.CPURequest,
-		CPULimit:      app.CPULimit,
-		MemoryRequest: app.MemoryRequest,
-		MemoryLimit:   app.MemoryLimit,
-		// Health check
-		HealthPath:         app.HealthPath,
-		HealthPort:         app.HealthPort,
-		HealthInitialDelay: app.HealthInitialDelay,
-		HealthPeriod:       app.HealthPeriod,
-		// HPA — reconciled every deploy from the app record so the cluster
-		// tracks UI/DB state; disabling removes the HPA cleanly.
-		HPAEnabled:      app.HPAEnabled,
-		HPAMinReplicas:  intPtrToInt32Ptr(app.MinReplicas),
-		HPAMaxReplicas:  intPtrToInt32Ptr(app.MaxReplicas),
-		HPATargetCPU:    intPtrToInt32Ptr(app.CPUTarget),
-		HPATargetMemory: intPtrToInt32Ptr(app.MemoryTarget),
-		// Default app URL
-		BaseDomain: h.appBaseDomain,
-	})
+	err = client.DeployApp(buildDeployRequestFromApp(app, h.appBaseDomain, secretName, envVars))
 	if err != nil {
 		msg := err.Error()
 		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
 		// Mark revision as failed
 		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
+	// Rollout observation. Kube accepted the spec; now watch the
+	// Deployment's pods actually come up. A bounded ctx lets us detect
+	// stuck rollouts (ImagePullBackOff, CrashLoopBackOff) rather than
+	// reporting "running" purely because the apply succeeded.
+	h.db.UpdateAppStatus(ctx, appID, "verifying", nil)
+	deadline := client.DeploymentProgressDeadline(ctx, app.Name, app.Namespace) + 10*time.Second
+	watchCtx, cancel := context.WithTimeout(ctx, deadline)
+	watchErr := client.WatchRollout(watchCtx, app.Name, app.Namespace)
+	cancel()
+	if watchErr != nil {
+		log.Printf("deploy: rollout verification failed app=%s revision=%d err=%v", appID, newRevision, watchErr)
+		h.autoRollback(ctx, appID, app, client, newRevision, watchErr)
 		return
 	}
 
@@ -654,29 +635,151 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	// Mark revision as successful
 	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "success", nil)
 
-	// Sync Ingress if domain is configured
-	if app.Domain != nil && *app.Domain != "" {
-		port := 80
-		if app.Port != nil {
-			port = *app.Port
+	h.syncCustomDomainIngress(ctx, appID, app, client, app.Port)
+
+	// Clean up old revisions (keep last 10). This is also the invariant that
+	// autoRollback relies on — prior revision N-1 must exist when deploy N
+	// fails. Don't lower `keep` below 2 without updating autoRollback's guard.
+	h.db.DeleteOldRevisions(ctx, appID, 10)
+}
+
+// syncSecretsToCluster decrypts the app's secrets from DB and writes them to
+// the cluster Secret object. Returns the secret name (empty if no secrets).
+// Called from both the forward deploy path and autoRollback so the cluster
+// Secret always reflects current DB state — critical during rollback because
+// secrets aren't versioned in revisions; a rotation during the watch window
+// needs to land in the cluster before the rollback pods start.
+func (h *Handler) syncSecretsToCluster(ctx context.Context, app *db.App, client *k8s.Client) (string, error) {
+	secrets, err := h.db.GetSecretsByAppID(ctx, app.ID)
+	if err != nil || len(secrets) == 0 {
+		return "", nil
+	}
+	secretData := make(map[string]string)
+	for _, s := range secrets {
+		decrypted, err := auth.Decrypt(s.ValueEncrypted, h.encryptKey)
+		if err != nil {
+			return "", fmt.Errorf("failed to decrypt secret: %w", err)
 		}
-		if err := client.CreateOrUpdateIngress(app.Name, app.Namespace, *app.Domain, port); err != nil {
-			// Log but don't fail the deploy
-			msg := "warning: failed to sync ingress: " + err.Error()
-			h.db.UpdateAppStatus(ctx, appID, "running", &msg)
-		} else {
-			// Update domain status to active
-			activeStatus := "active"
-			h.db.UpdateAppDomain(ctx, db.UpdateAppDomainParams{
-				ID:           appID,
-				Domain:       app.Domain,
-				DomainStatus: &activeStatus,
-			})
-		}
+		secretData[s.Key] = string(decrypted)
+	}
+	secretName := app.Name + "-secrets"
+	if err := client.CreateOrUpdateSecret(secretName, app.Namespace, secretData); err != nil {
+		return "", fmt.Errorf("failed to create k8s secret: %w", err)
+	}
+	return secretName, nil
+}
+
+// syncCustomDomainIngress reconciles the Ingress for an app's custom domain
+// (if one is configured) and updates the domain_status row on success.
+// Idempotent; called from both the forward deploy path and autoRollback.
+// Port is passed explicitly because the rolled-back revision may have a
+// different Port than the live app.Port (app fields aren't re-copied from
+// the revision on rollback).
+func (h *Handler) syncCustomDomainIngress(ctx context.Context, appID string, app *db.App, client *k8s.Client, port *int) {
+	if app.Domain == nil || *app.Domain == "" {
+		return
+	}
+	p := 80
+	if port != nil {
+		p = *port
+	}
+	if err := client.CreateOrUpdateIngress(app.Name, app.Namespace, *app.Domain, p); err != nil {
+		msg := "warning: failed to sync ingress: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "running", &msg)
+		return
+	}
+	activeStatus := "active"
+	h.db.UpdateAppDomain(ctx, db.UpdateAppDomainParams{
+		ID:           appID,
+		Domain:       app.Domain,
+		DomainStatus: &activeStatus,
+	})
+}
+
+// autoRollback is invoked when WatchRollout reports the new revision never
+// became healthy. It redeploys the app's last successful revision
+// (app.CurrentRevision) inline — same DeployApp path, no watch on the
+// rollback itself (v1). Called under the per-app deploy mutex already held
+// by deployApp, so the total worst-case time the mutex is held is ~2 ×
+// progressDeadline plus pre-deploy hook time — roughly 20–30 minutes upper
+// bound. Concurrent deploys on the same app queue behind it (intended).
+//
+// Rollback-target selection:
+//   - app.CurrentRevision == 0 → no prior successful deploy; app stays
+//     "failed". (Happens on a first-ever-deploy failure.)
+//   - otherwise → rollback to app.CurrentRevision. On success, revision N
+//     (the failed forward) is marked "rolled_back" and app.CurrentRevision
+//     is left unchanged (it already points at the successful target).
+//     Critically we do NOT target newRevision-1 — with MAX+1 allocation,
+//     newRevision-1 can be a previously-rolled-back revision from an earlier
+//     incident, which would be the wrong thing to redeploy.
+//
+// Known v1 gaps (tracked in ROADMAP Phase 2.11):
+//   - Server restart between UpdateAppStatus("verifying") and the terminal
+//     status leaves the row orphaned in "verifying" — no boot-time reconciler
+//     sweeps it.
+//   - Secrets are re-resolved from the live rows rather than snapshotted in
+//     the revision, so a rollback cannot recover a deploy broken by a deleted
+//     secret key that the prior revision's env references.
+func (h *Handler) autoRollback(ctx context.Context, appID string, app *db.App, client *k8s.Client, newRevision int, deployErr error) {
+	origMsg := "rollout did not become ready: " + deployErr.Error()
+
+	if app.CurrentRevision <= 0 {
+		log.Printf("rollback: first-deploy-cannot-rollback app=%s revision=%d", appID, newRevision)
+		h.db.UpdateAppStatus(ctx, appID, "failed", &origMsg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &origMsg)
+		return
 	}
 
-	// Clean up old revisions (keep last 10)
-	h.db.DeleteOldRevisions(ctx, appID, 10)
+	prior, err := h.db.GetRevision(ctx, appID, app.CurrentRevision)
+	if err != nil {
+		log.Printf("rollback: prior-revision-missing app=%s target_revision=%d err=%v", appID, app.CurrentRevision, err)
+		msg := origMsg + " | rollback aborted: prior revision " + strconv.Itoa(app.CurrentRevision) + " not found: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
+	log.Printf("rollback: starting app=%s from=%d to=%d reason=%v", appID, newRevision, prior.RevisionNumber, deployErr)
+	h.db.UpdateAppStatus(ctx, appID, "rolling_back", &origMsg)
+
+	// Env vars come from the revision snapshot. Secret values aren't
+	// versioned — re-sync the cluster Secret from current DB state (matches
+	// the forward path and handles the case where secrets rotated during the
+	// watch window). A rollback can recover from an env-var regression but
+	// not from a deleted secret key that revision N-1's env references.
+	var envVars map[string]string
+	if len(prior.EnvVars) > 0 {
+		_ = json.Unmarshal(prior.EnvVars, &envVars)
+	}
+	secretName, err := h.syncSecretsToCluster(ctx, app, client)
+	if err != nil {
+		log.Printf("rollback: secret sync failed app=%s err=%v original_err=%v", appID, err, deployErr)
+		msg := origMsg + " | rollback secret sync failed: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
+	if err := client.DeployApp(buildDeployRequestFromRevision(app, prior, h.appBaseDomain, secretName, envVars)); err != nil {
+		log.Printf("rollback: failed app=%s target_revision=%d err=%v original_err=%v", appID, prior.RevisionNumber, err, deployErr)
+		msg := origMsg + " | rollback to revision " + strconv.Itoa(prior.RevisionNumber) + " also failed: " + err.Error()
+		h.db.UpdateAppStatus(ctx, appID, "failed", &msg)
+		h.db.UpdateRevisionStatus(ctx, appID, newRevision, "failed", &msg)
+		return
+	}
+
+	log.Printf("rollback: succeeded app=%s target_revision=%d", appID, prior.RevisionNumber)
+	// app.CurrentRevision already equals prior.RevisionNumber (that's how we
+	// selected the rollback target above), so no UpdateAppRevision call is
+	// needed. Subsequent deploys will allocate their revision number via
+	// GetNextRevisionNumber (MAX+1), which is collision-free regardless.
+	h.db.UpdateAppStatus(ctx, appID, "running", nil)
+	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "rolled_back", &origMsg)
+
+	// Mirror the happy path: re-reconcile the custom-domain Ingress so it
+	// matches revision N-1's Port if that changed between N-1 and N.
+	h.syncCustomDomainIngress(ctx, appID, app, client, prior.Port)
 }
 
 func (h *Handler) DeleteApp(w http.ResponseWriter, r *http.Request) {
@@ -861,14 +964,17 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Rollback to previous revision (current - 1)
+		// Rollback to the last *successful* revision before CurrentRevision.
+		// CurrentRevision-1 is unsafe: MAX+1 allocation can leave gaps where
+		// the intervening numbers are rolled_back or failed revisions. We
+		// must skip those to find the previous known-good deploy.
 		if app.CurrentRevision <= 1 {
 			httpError(w, "no previous revision to rollback to", http.StatusBadRequest)
 			return
 		}
-		targetRevision, err = h.db.GetRevision(r.Context(), appID, app.CurrentRevision-1)
+		targetRevision, err = h.db.GetLastSuccessfulRevisionBefore(r.Context(), appID, app.CurrentRevision)
 		if err != nil {
-			httpError(w, "previous revision not found", http.StatusNotFound)
+			httpError(w, "no previous successful revision to rollback to", http.StatusNotFound)
 			return
 		}
 	}
@@ -910,6 +1016,15 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CurrentRevision must point at the target BEFORE deployApp runs. If we
+	// leave it at the broken revision, a subsequent watch-timeout would
+	// invoke autoRollback, which reads app.CurrentRevision as the rollback
+	// target — and redeploys the very revision the user was escaping from.
+	if err := h.db.UpdateAppRevision(r.Context(), appID, targetRevision.RevisionNumber); err != nil {
+		httpError(w, "failed to update current revision", http.StatusInternalServerError)
+		return
+	}
+
 	// Get cluster for deployment
 	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
 	if err != nil {
@@ -927,8 +1042,23 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 	// Update status to deploying
 	h.db.UpdateAppStatus(r.Context(), appID, "rolling_back", nil)
 
-	// Re-fetch app with updated config and deploy
-	updatedApp, _ := h.db.GetApp(r.Context(), appID)
+	// Belt-and-suspenders for C1: even if both this re-fetch AND deployApp's
+	// in-goroutine re-fetch fail (narrow DB-outage window), the snapshot
+	// we hand to deployApp must carry the new CurrentRevision. Otherwise
+	// autoRollback would target the broken revision the user is escaping.
+	app.CurrentRevision = targetRevision.RevisionNumber
+
+	// Re-fetch app with the UpdateApp changes from above applied. If the
+	// re-fetch fails we fall back to the pre-update `app` (with the
+	// in-memory CurrentRevision fix above): stale by one field-copy but
+	// still a valid pointer, and deployApp's own in-goroutine GetApp will
+	// try again. Without this guard, a failing GetApp would pass a nil
+	// pointer to deployApp.
+	updatedApp, err := h.db.GetApp(r.Context(), appID)
+	if err != nil {
+		log.Printf("rollback: app re-fetch failed — falling back to pre-update snapshot app=%s err=%v", appID, err)
+		updatedApp = app
+	}
 	go h.deployApp(appID, updatedApp, kubeconfig)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
