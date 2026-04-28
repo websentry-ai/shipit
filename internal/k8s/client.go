@@ -72,6 +72,24 @@ type DeployRequest struct {
 
 	// Default ingress hostname (auto-generated URL)
 	BaseDomain string // e.g., "apps.shipit.unboundsec.dev" - if set, creates ingress at <name>.apps.shipit.unboundsec.dev
+
+	// Zero-downtime mode (Phase 2.11). The renderer defaults to safe primitives
+	// (PDB, topologySpread, preStop, derived rolling-update budget); set this
+	// flag to opt OUT and fall back to raw kube defaults (RollingUpdate
+	// 25%/25%, no PDB, no topologySpread, no preStop). The inverted default
+	// means existing test fixtures and any caller that does not know about the
+	// toggle keep getting safe defaults.
+	DisableZeroDowntime bool
+
+	// Optional rolling-update overrides. Only honored when zero-downtime mode
+	// is on. Strings so they can be either int ("1") or percent ("25%");
+	// validation happens at the API layer. nil = derive from rollingUpdateBudget().
+	MaxSurgeOverride       *string
+	MaxUnavailableOverride *string
+
+	// Longest expected request in seconds. Drives terminationGracePeriodSeconds
+	// (request_duration + 10s buffer). Zero/unset falls back to 30s.
+	MaxRequestDurationSeconds int
 }
 
 type DeploymentStatus struct {
@@ -187,17 +205,22 @@ func (c *Client) DeployApp(req DeployRequest) error {
 		Image:           req.Image,
 		Env:             envVars,
 		ImagePullPolicy: imagePullPolicyFor(req.Image),
-		// preStop delay covers kube-proxy/ingress endpoint propagation so in-flight
-		// requests are not dropped when the pod is removed from Service rotation
-		// during a rolling update. The /bin/sh fallback is a best-effort no-op on
-		// distroless images (kubelet treats a failed preStop exec as complete).
-		Lifecycle: &corev1.Lifecycle{
+	}
+	// preStop delay covers kube-proxy/ingress endpoint propagation so in-flight
+	// requests are not dropped when the pod is removed from Service rotation
+	// during a rolling update. The /bin/sh fallback is a best-effort no-op on
+	// distroless images (kubelet treats a failed preStop exec as complete).
+	// Skipped when zero-downtime mode is off so the renderer matches raw kube
+	// defaults (useful escape hatch for batch/job-style pods that should exit
+	// immediately on SIGTERM rather than linger).
+	if !req.DisableZeroDowntime {
+		container.Lifecycle = &corev1.Lifecycle{
 			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{
 					Command: []string{"/bin/sh", "-c", "sleep 5"},
 				},
 			},
-		},
+		}
 	}
 
 	// Inject secrets from K8s Secret if specified
@@ -319,8 +342,18 @@ func (c *Client) DeployApp(req DeployRequest) error {
 	// req.Replicas=3 on a 15-pod fleet means 1-pod-at-a-time rollouts even
 	// though 25%/25% would be safe and ~4× faster. Mirrors the PDB's effective-
 	// fleet logic for consistency (see ensurePodDisruptionBudget).
-	maxSurge, maxUnavailable := rollingUpdateBudget(effectiveFleet(req, existing))
+	maxSurge, maxUnavailable := resolveRollingUpdateBudget(req, effectiveFleet(req, existing))
+	// terminationGrace = max_request_duration + 10s buffer so the longest
+	// in-flight request can drain before SIGKILL. Floor 30s matches the
+	// kube default and keeps existing apps stable when the new column was
+	// just backfilled with the default.
 	terminationGrace := int64(30)
+	if req.MaxRequestDurationSeconds > 0 {
+		terminationGrace = int64(req.MaxRequestDurationSeconds) + 10
+		if terminationGrace < 30 {
+			terminationGrace = 30
+		}
+	}
 	progressDeadline := int32(600)
 	historyLimit := int32(10)
 
@@ -351,7 +384,7 @@ func (c *Client) DeployApp(req DeployRequest) error {
 				Spec: corev1.PodSpec{
 					Containers:                    []corev1.Container{container},
 					TerminationGracePeriodSeconds: &terminationGrace,
-					TopologySpreadConstraints:     topologySpreadFor(req.Name),
+					TopologySpreadConstraints:     topologySpreadConstraints(req),
 				},
 			},
 		},
@@ -465,6 +498,49 @@ func rollingUpdateBudget(replicas int32) (intstr.IntOrString, intstr.IntOrString
 	return intstr.FromString("25%"), intstr.FromString("25%")
 }
 
+// resolveRollingUpdateBudget picks the rolling-update strategy:
+//   - zero-downtime off → raw kube defaults (25%/25%) regardless of fleet size
+//   - zero-downtime on  → derived from rollingUpdateBudget(), unless the user
+//     supplied an explicit override on either field
+//
+// Overrides accept either an integer string ("1") or percentage ("25%"); the
+// API layer is responsible for rejecting the deadlock case (both = 0). Bad
+// strings fall back to derived to preserve safety in the renderer.
+func resolveRollingUpdateBudget(req DeployRequest, fleet int32) (intstr.IntOrString, intstr.IntOrString) {
+	if req.DisableZeroDowntime {
+		return intstr.FromString("25%"), intstr.FromString("25%")
+	}
+	surge, unavail := rollingUpdateBudget(fleet)
+	if v, ok := parseIntOrPercent(req.MaxSurgeOverride); ok {
+		surge = v
+	}
+	if v, ok := parseIntOrPercent(req.MaxUnavailableOverride); ok {
+		unavail = v
+	}
+	return surge, unavail
+}
+
+// parseIntOrPercent accepts "1", "25%", "" or nil. Returns (parsed, true) on
+// a valid spec; (zero, false) otherwise so callers can fall back to derived.
+func parseIntOrPercent(s *string) (intstr.IntOrString, bool) {
+	if s == nil || *s == "" {
+		return intstr.IntOrString{}, false
+	}
+	v := *s
+	if strings.HasSuffix(v, "%") {
+		n, err := strconv.Atoi(strings.TrimSuffix(v, "%"))
+		if err != nil || n < 0 || n > 100 {
+			return intstr.IntOrString{}, false
+		}
+		return intstr.FromString(v), true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return intstr.IntOrString{}, false
+	}
+	return intstr.FromInt(n), true
+}
+
 // effectiveFleet is the replica count both the rolling-update budget and the
 // PDB should reason about. It takes the max of:
 //   - req.Replicas (the static DB value — floor for a brand-new deploy)
@@ -505,6 +581,17 @@ func imagePullPolicyFor(image string) corev1.PullPolicy {
 		return corev1.PullAlways
 	}
 	return corev1.PullIfNotPresent
+}
+
+// topologySpreadConstraints returns the spread constraints to apply for this
+// deploy. Empty slice when zero-downtime mode is disabled — the caller still
+// passes the field through, but kube treats nil/empty as "no constraints"
+// which matches raw default scheduling.
+func topologySpreadConstraints(req DeployRequest) []corev1.TopologySpreadConstraint {
+	if req.DisableZeroDowntime {
+		return nil
+	}
+	return topologySpreadFor(req.Name)
 }
 
 // topologySpreadFor returns constraints that spread pods across zones and
@@ -556,7 +643,10 @@ func (c *Client) ensurePodDisruptionBudget(ctx context.Context, req DeployReques
 		}
 	}
 
-	if effective <= 1 {
+	// When zero-downtime mode is off, tear down any PDB we previously
+	// created so the user opts back into raw kube behavior (drains evict
+	// freely). Same code path as the effective<=1 branch below.
+	if req.DisableZeroDowntime || effective <= 1 {
 		err := pdbs.Delete(ctx, req.Name, metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err

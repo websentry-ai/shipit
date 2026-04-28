@@ -79,6 +79,15 @@ type App struct {
 	ManagedBy    string  `db:"managed_by" json:"managed_by"`                     // "shipit", "porter", or "observer"
 	PorterAppID  *string `db:"porter_app_id" json:"porter_app_id,omitempty"`     // Porter's internal app ID
 	PorterAppURL *string `db:"porter_app_url" json:"porter_app_url,omitempty"`   // Porter dashboard URL
+
+	// Zero-downtime mode (Phase 2.11). When false, the renderer skips PDB,
+	// topologySpread, and preStop, and falls back to RollingUpdate 25%/25%
+	// — i.e. closer to raw kube defaults. Override fields hold user-supplied
+	// rolling-update budget values; nil means "derive from replica count".
+	ZeroDowntimeEnabled        bool    `db:"zero_downtime_enabled" json:"zero_downtime_enabled"`
+	MaxSurgeOverride           *string `db:"max_surge_override" json:"max_surge_override,omitempty"`
+	MaxUnavailableOverride     *string `db:"max_unavailable_override" json:"max_unavailable_override,omitempty"`
+	MaxRequestDurationSeconds  int     `db:"max_request_duration_seconds" json:"max_request_duration_seconds"`
 }
 
 // AppRevision stores a snapshot of app configuration at deploy time
@@ -123,6 +132,13 @@ type AppRevision struct {
 	DeployStatus  string     `db:"deploy_status" json:"deploy_status"`
 	DeployMessage *string    `db:"deploy_message" json:"deploy_message,omitempty"`
 	DeployedAt    *time.Time `db:"deployed_at" json:"deployed_at,omitempty"`
+
+	// Zero-downtime snapshot (Phase 2.11). Pointer types because revisions
+	// pre-dating the migration carry NULL.
+	ZeroDowntimeEnabled       *bool   `db:"zero_downtime_enabled" json:"zero_downtime_enabled,omitempty"`
+	MaxSurgeOverride          *string `db:"max_surge_override" json:"max_surge_override,omitempty"`
+	MaxUnavailableOverride    *string `db:"max_unavailable_override" json:"max_unavailable_override,omitempty"`
+	MaxRequestDurationSeconds *int    `db:"max_request_duration_seconds" json:"max_request_duration_seconds,omitempty"`
 }
 
 type AppSecret struct {

@@ -561,6 +561,11 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		Domain: app.Domain,
 		// Pre-deploy hook snapshot
 		PreDeployCommand: app.PreDeployCommand,
+		// Zero-downtime snapshot (Phase 2.11)
+		ZeroDowntimeEnabled:       &app.ZeroDowntimeEnabled,
+		MaxSurgeOverride:          app.MaxSurgeOverride,
+		MaxUnavailableOverride:    app.MaxUnavailableOverride,
+		MaxRequestDurationSeconds: &app.MaxRequestDurationSeconds,
 	})
 	if err != nil {
 		msg := "failed to create revision: " + err.Error()

@@ -105,6 +105,10 @@ func NewRouter(database *db.DB, cfg *config.Config, porterDiscovery *porter.Disc
 			r.Get("/predeploy", h.GetPreDeployHook)
 			r.Put("/predeploy", h.SetPreDeployHook)
 
+			// Reliability (zero-downtime mode + rolling-update overrides)
+			r.Get("/reliability", h.GetReliability)
+			r.Put("/reliability", h.SetReliability)
+
 			// Exec - run commands in containers
 			r.Post("/exec", h.ExecCommand)
 			r.Get("/exec/interactive", h.ExecInteractive)
