@@ -34,4 +34,40 @@ func TestResolveUnavailableToInt(t *testing.T) {
 	}
 }
 
+// On fleets with <=3 replicas the renderer derives maxUnavailable="0", so
+// the deadlock check must evaluate *effective* values: explicit surge="0"
+// + omitted unavail still produces a 0/0 rollout that can never make
+// progress. Earlier the check only inspected the explicit overrides.
+func TestDerivedRollingUpdate_DeadlockCases(t *testing.T) {
+	cases := []struct {
+		name           string
+		replicas       int32
+		surgeOverride  *string
+		unavailOverr   *string
+		wantSurge      string
+		wantUnavail    string
+		wantDeadlocked bool
+	}{
+		{"small fleet defaults", 3, nil, nil, "1", "0", false},
+		{"large fleet defaults", 10, nil, nil, "25%", "25%", false},
+		{"surge=0 + nil unavail on small fleet", 3, strPtrAPI("0"), nil, "0", "0", true},
+		{"surge=0% + nil unavail on small fleet", 3, strPtrAPI("0%"), nil, "0%", "0", true},
+		{"both explicit zero", 5, strPtrAPI("0"), strPtrAPI("0"), "0", "0", true},
+		{"explicit surge=0 on large fleet (unavail derives to 25%)", 10, strPtrAPI("0"), nil, "0", "25%", false},
+		{"explicit unavail=0 on large fleet (surge derives to 25%)", 10, nil, strPtrAPI("0"), "25%", "0", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, u := derivedRollingUpdate(tc.replicas, tc.surgeOverride, tc.unavailOverr)
+			if s != tc.wantSurge || u != tc.wantUnavail {
+				t.Errorf("got (%q,%q), want (%q,%q)", s, u, tc.wantSurge, tc.wantUnavail)
+			}
+			deadlocked := isZero(&s) && isZero(&u)
+			if deadlocked != tc.wantDeadlocked {
+				t.Errorf("deadlock=%v, want %v", deadlocked, tc.wantDeadlocked)
+			}
+		})
+	}
+}
+
 func strPtrAPI(s string) *string { return &s }

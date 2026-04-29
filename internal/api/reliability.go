@@ -136,7 +136,12 @@ func (h *Handler) SetReliability(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if isZero(surge) && isZero(unavail) {
+	// Reject the deadlock case using *effective* values, not just the
+	// explicit overrides: on fleets with <=3 replicas the renderer derives
+	// maxUnavailable="0", so an explicit max_surge="0" with omitted unavail
+	// would still lock up the rollout.
+	effSurge, effUnavail := derivedRollingUpdate(int32(app.Replicas), surge, unavail)
+	if isZero(&effSurge) && isZero(&effUnavail) {
 		httpError(w, "max_surge and max_unavailable cannot both be 0 (rollout would deadlock)", http.StatusBadRequest)
 		return
 	}
