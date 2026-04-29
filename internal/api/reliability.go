@@ -140,10 +140,15 @@ func (h *Handler) SetReliability(w http.ResponseWriter, r *http.Request) {
 		httpError(w, "max_surge and max_unavailable cannot both be 0 (rollout would deadlock)", http.StatusBadRequest)
 		return
 	}
-	// Integer maxUnavailable must leave at least one pod running.
-	if n, ok := parseIntOverride(unavail); ok && n >= app.Replicas && app.Replicas > 0 {
-		httpError(w, fmt.Sprintf("max_unavailable (%d) must be < replicas (%d)", n, app.Replicas), http.StatusBadRequest)
-		return
+	// maxUnavailable must leave at least one pod running. K8s computes the
+	// integer floor of (replicas * pct / 100) for percent values (roundUp=false
+	// for maxUnavailable), so 100% on 2 replicas drains both pods. Reject any
+	// override — int or percent — that resolves to >= replicas.
+	if app.Replicas > 0 {
+		if n, ok := resolveUnavailableToInt(unavail, app.Replicas); ok && n >= app.Replicas {
+			httpError(w, fmt.Sprintf("max_unavailable (%s) would leave no pods running for %d replicas", *unavail, app.Replicas), http.StatusBadRequest)
+			return
+		}
 	}
 	dur := req.MaxRequestDurationSeconds
 	if dur == 0 {
@@ -336,11 +341,20 @@ func isZero(s *string) bool {
 	return err == nil && n == 0
 }
 
-// parseIntOverride extracts the integer value from a non-percent override.
-// Returns ok=false for nil, empty, or percent values.
-func parseIntOverride(s *string) (int, bool) {
-	if s == nil || strings.HasSuffix(*s, "%") {
+// resolveUnavailableToInt returns the effective pod count an override would
+// allow to be unavailable, given the replica count. Mirrors K8s' rounding for
+// maxUnavailable (floor) so the validator rejects the same configurations
+// the cluster would treat as "drain all pods".
+func resolveUnavailableToInt(s *string, replicas int) (int, bool) {
+	if s == nil {
 		return 0, false
+	}
+	if strings.HasSuffix(*s, "%") {
+		pct, err := strconv.Atoi(strings.TrimSuffix(*s, "%"))
+		if err != nil {
+			return 0, false
+		}
+		return (replicas * pct) / 100, true
 	}
 	n, err := strconv.Atoi(*s)
 	if err != nil {

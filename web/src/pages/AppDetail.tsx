@@ -125,7 +125,7 @@ export default function AppDetail() {
     enabled: !!app?.cluster_id && activeTab === 'domain',
   });
 
-  const { data: reliability, isLoading: reliabilityLoading } = useQuery({
+  const { data: reliability, isLoading: reliabilityLoading, isError: reliabilityError, error: reliabilityErr, refetch: refetchReliability } = useQuery({
     queryKey: ['reliability', appId],
     queryFn: () => getReliability(appId!),
     enabled: !!appId && activeTab === 'reliability',
@@ -1168,13 +1168,23 @@ export default function AppDetail() {
             </p>
           </div>
 
-          {reliabilityLoading || !reliability ? (
+          {reliabilityLoading ? (
             <div className="flex justify-center py-12">
               <Skeleton width={32} height={32} rounded="full" />
+            </div>
+          ) : reliabilityError || !reliability ? (
+            <div className="p-6 space-y-3">
+              <p className="text-sm text-danger">
+                Failed to load reliability configuration{reliabilityErr instanceof Error ? `: ${reliabilityErr.message}` : '.'}
+              </p>
+              <Button type="button" variant="secondary" onClick={() => refetchReliability()}>
+                Retry
+              </Button>
             </div>
           ) : (
             <div className="p-6 space-y-6">
               <form
+                key={`${reliability.enabled}|${reliability.advanced.max_surge ?? ''}|${reliability.advanced.max_unavailable ?? ''}|${reliability.advanced.max_request_duration_seconds}`}
                 onSubmit={(e) => {
                   e.preventDefault();
                   const fd = new FormData(e.currentTarget);
