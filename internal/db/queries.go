@@ -81,7 +81,10 @@ func (db *DB) DeleteProject(ctx context.Context, id string) error {
 func (db *DB) ListClusters(ctx context.Context, projectID string) ([]Cluster, error) {
 	var clusters []Cluster
 	err := db.SelectContext(ctx, &clusters, `
-		SELECT id, project_id, name, endpoint, status, status_message, created_at
+		SELECT id, project_id, name, endpoint, status, status_message, created_at,
+		       monitoring_status, monitoring_status_message, monitoring_grafana_host,
+		       monitoring_helm_release, monitoring_chart_version,
+		       monitoring_installed_at, monitoring_updated_at
 		FROM clusters WHERE project_id = $1 ORDER BY created_at DESC
 	`, projectID)
 	return clusters, err
@@ -128,6 +131,42 @@ func (db *DB) UpdateClusterStatus(ctx context.Context, id, status string, messag
 
 func (db *DB) DeleteCluster(ctx context.Context, id string) error {
 	_, err := db.ExecContext(ctx, `DELETE FROM clusters WHERE id = $1`, id)
+	return err
+}
+
+// UpdateClusterMonitoringParams carries the fields the installer/reconciler
+// touches. Pointer fields are only written when non-nil so callers can flip
+// status without clearing GrafanaHost (and vice versa).
+type UpdateClusterMonitoringParams struct {
+	ClusterID     string
+	Status        string  // required: disabled|installing|ready|failed|uninstalling
+	StatusMessage *string // nil = keep existing
+	GrafanaHost   *string // nil = keep existing
+	HelmRelease   *string // nil = keep existing
+	ChartVersion  *string // nil = keep existing
+	SetInstalled  bool    // true on first transition to ready: stamps monitoring_installed_at = NOW()
+}
+
+// UpdateClusterMonitoring writes monitoring lifecycle fields. Always bumps
+// monitoring_updated_at so the UI can show "X minutes ago" since last reconcile.
+func (db *DB) UpdateClusterMonitoring(ctx context.Context, p UpdateClusterMonitoringParams) error {
+	query := `
+		UPDATE clusters SET
+			monitoring_status = $1,
+			monitoring_status_message = COALESCE($2, monitoring_status_message),
+			monitoring_grafana_host = COALESCE($3, monitoring_grafana_host),
+			monitoring_helm_release = COALESCE($4, monitoring_helm_release),
+			monitoring_chart_version = COALESCE($5, monitoring_chart_version),
+			monitoring_updated_at = NOW()
+	`
+	if p.SetInstalled {
+		query += `, monitoring_installed_at = COALESCE(monitoring_installed_at, NOW())`
+	}
+	query += ` WHERE id = $6`
+	_, err := db.ExecContext(ctx, query,
+		p.Status, p.StatusMessage, p.GrafanaHost, p.HelmRelease, p.ChartVersion,
+		p.ClusterID,
+	)
 	return err
 }
 

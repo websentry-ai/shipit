@@ -28,6 +28,15 @@ type Cluster struct {
 	Status              string    `db:"status" json:"status"`
 	StatusMessage       *string   `db:"status_message" json:"status_message,omitempty"`
 	CreatedAt           time.Time `db:"created_at" json:"created_at"`
+
+	// Monitoring add-on (kube-prometheus-stack via Helm). disabled = no install yet.
+	MonitoringStatus        string     `db:"monitoring_status" json:"monitoring_status"`
+	MonitoringStatusMessage *string    `db:"monitoring_status_message" json:"monitoring_status_message,omitempty"`
+	MonitoringGrafanaHost   *string    `db:"monitoring_grafana_host" json:"monitoring_grafana_host,omitempty"`
+	MonitoringHelmRelease   *string    `db:"monitoring_helm_release" json:"monitoring_helm_release,omitempty"`
+	MonitoringChartVersion  *string    `db:"monitoring_chart_version" json:"monitoring_chart_version,omitempty"`
+	MonitoringInstalledAt   *time.Time `db:"monitoring_installed_at" json:"monitoring_installed_at,omitempty"`
+	MonitoringUpdatedAt     *time.Time `db:"monitoring_updated_at" json:"monitoring_updated_at,omitempty"`
 }
 
 type App struct {
