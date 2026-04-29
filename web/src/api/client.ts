@@ -13,6 +13,8 @@ import type {
   DomainConfig,
   PreDeployHookStatus,
   PreDeployHookConfig,
+  ReliabilityConfig,
+  ReliabilityResponse,
   User,
   UserToken,
   CreateTokenRequest,
@@ -271,6 +273,21 @@ export async function setPreDeployHook(
   config: PreDeployHookConfig
 ): Promise<PreDeployHookStatus> {
   return request<PreDeployHookStatus>(`/apps/${appId}/predeploy`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
+}
+
+// Reliability (zero-downtime mode + advanced rolling-update overrides)
+export async function getReliability(appId: string): Promise<ReliabilityResponse> {
+  return request<ReliabilityResponse>(`/apps/${appId}/reliability`);
+}
+
+export async function setReliability(
+  appId: string,
+  config: ReliabilityConfig
+): Promise<ReliabilityResponse> {
+  return request<ReliabilityResponse>(`/apps/${appId}/reliability`, {
     method: 'PUT',
     body: JSON.stringify(config),
   });

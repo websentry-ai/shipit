@@ -22,8 +22,10 @@ import {
   setPreDeployHook,
   getClusterIngress,
   switchAppManagement,
+  getReliability,
+  setReliability,
 } from '../api/client';
-import type { AppRevision, AppSecret, UpdateAppRequest, HPAConfig, DomainConfig, PreDeployHookConfig } from '../types';
+import type { AppRevision, AppSecret, UpdateAppRequest, HPAConfig, DomainConfig, PreDeployHookConfig, ReliabilityConfig } from '../types';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { StatusBadge } from '../components/ui/Badge';
@@ -50,7 +52,7 @@ export default function AppDetail() {
   const { appId } = useParams<{ appId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'autoscaling' | 'domain' | 'hooks' | 'revisions' | 'monitoring' | 'logs'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'env' | 'secrets' | 'autoscaling' | 'domain' | 'hooks' | 'reliability' | 'revisions' | 'monitoring' | 'logs'>('overview');
   const [logs, setLogs] = useState<string[]>([]);
   const [showSecretModal, setShowSecretModal] = useState(false);
   const [newSecretKey, setNewSecretKey] = useState('');
@@ -121,6 +123,12 @@ export default function AppDetail() {
     queryKey: ['cluster-ingress', app?.cluster_id],
     queryFn: () => getClusterIngress(app!.cluster_id),
     enabled: !!app?.cluster_id && activeTab === 'domain',
+  });
+
+  const { data: reliability, isLoading: reliabilityLoading, isError: reliabilityError, error: reliabilityErr, refetch: refetchReliability } = useQuery({
+    queryKey: ['reliability', appId],
+    queryFn: () => getReliability(appId!),
+    enabled: !!appId && activeTab === 'reliability',
   });
 
   const deployMutation = useMutation({
@@ -197,6 +205,14 @@ export default function AppDetail() {
     mutationFn: (config: PreDeployHookConfig) => setPreDeployHook(appId!, config),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['predeploy', appId] });
+      queryClient.invalidateQueries({ queryKey: ['app', appId] });
+    },
+  });
+
+  const reliabilityMutation = useMutation({
+    mutationFn: (config: ReliabilityConfig) => setReliability(appId!, config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['reliability', appId] });
       queryClient.invalidateQueries({ queryKey: ['app', appId] });
     },
   });
@@ -425,6 +441,7 @@ export default function AppDetail() {
           <Tab active={activeTab === 'autoscaling'} onClick={() => setActiveTab('autoscaling')}>Autoscaling</Tab>
           <Tab active={activeTab === 'domain'} onClick={() => setActiveTab('domain')}>Domain</Tab>
           <Tab active={activeTab === 'hooks'} onClick={() => setActiveTab('hooks')}>Hooks</Tab>
+          <Tab active={activeTab === 'reliability'} onClick={() => setActiveTab('reliability')}>Reliability</Tab>
           <Tab active={activeTab === 'revisions'} onClick={() => setActiveTab('revisions')}>Revisions</Tab>
           <Tab active={activeTab === 'logs'} onClick={() => setActiveTab('logs')}>Logs</Tab>
         </nav>
@@ -1133,6 +1150,215 @@ export default function AppDetail() {
                   </Button>
                   {preDeployMutation.isSuccess && (
                     <span className="text-sm text-success">Saved successfully!</span>
+                  )}
+                </div>
+              </form>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {activeTab === 'reliability' && (
+        <Card padding="none">
+          <div className="p-4 border-b border-border">
+            <h3 className="text-lg font-medium text-text-primary">Zero-Downtime Mode</h3>
+            <p className="mt-1 text-sm text-text-secondary">
+              Survive node drains, rolling updates, and pod failures with no user-visible 5xx.
+              Bundles PodDisruptionBudget, topology spread, preStop drain, and a derived rolling-update budget.
+            </p>
+          </div>
+
+          {reliabilityLoading ? (
+            <div className="flex justify-center py-12">
+              <Skeleton width={32} height={32} rounded="full" />
+            </div>
+          ) : reliabilityError || !reliability ? (
+            <div className="p-6 space-y-3">
+              <p className="text-sm text-danger">
+                Failed to load reliability configuration{reliabilityErr instanceof Error ? `: ${reliabilityErr.message}` : '.'}
+              </p>
+              <Button type="button" variant="secondary" onClick={() => refetchReliability()}>
+                Retry
+              </Button>
+            </div>
+          ) : (
+            <div className="p-6 space-y-6">
+              <form
+                key={`${reliability.enabled}|${reliability.advanced.max_surge ?? ''}|${reliability.advanced.max_unavailable ?? ''}|${reliability.advanced.max_request_duration_seconds}`}
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const fd = new FormData(e.currentTarget);
+                  const surge = (fd.get('max_surge') as string).trim();
+                  const unavail = (fd.get('max_unavailable') as string).trim();
+                  reliabilityMutation.mutate({
+                    enabled: fd.get('enabled') === 'on',
+                    max_surge: surge || null,
+                    max_unavailable: unavail || null,
+                    max_request_duration_seconds:
+                      parseInt(fd.get('max_request_duration_seconds') as string) ||
+                      reliability.advanced.max_request_duration_seconds,
+                  });
+                }}
+                className="space-y-6"
+              >
+                <div className="flex items-center gap-3">
+                  <input
+                    type="checkbox"
+                    name="enabled"
+                    id="reliability-enabled"
+                    defaultChecked={reliability.enabled}
+                    className="h-4 w-4 rounded border-border text-accent focus:ring-accent"
+                  />
+                  <label htmlFor="reliability-enabled" className="text-sm font-medium text-text-primary">
+                    Enable Zero-Downtime Mode
+                  </label>
+                </div>
+
+                {!reliability.preconditions.replicas_ok && (
+                  <div className="p-3 rounded-lg bg-warning-muted border border-warning/20 text-sm text-warning">
+                    Replicas &lt; {reliability.preconditions.min_replicas_required}. Zero-downtime mode is most effective with at least 2 replicas (or HPA min ≥ 2).
+                  </div>
+                )}
+                {!reliability.preconditions.health_path_set && reliability.enabled && (
+                  <div className="p-3 rounded-lg bg-info-muted border border-info/20 text-sm text-text-secondary">
+                    No <code>health_path</code> configured — falling back to a TCP probe on the container port. Configure a <code>/health</code> endpoint on the Health tab for an HTTP readiness check.
+                  </div>
+                )}
+                {!reliability.preconditions.image_tag_immutable && (
+                  <div className="p-3 rounded-lg bg-warning-muted border border-warning/20 text-sm text-warning">
+                    Image uses a mutable tag (e.g. <code>:latest</code>). Rollbacks will not work reliably until the image is pinned to a SHA or version.
+                  </div>
+                )}
+
+                {/* Diff preview — what changes on next deploy */}
+                <div className="rounded-lg border border-border overflow-hidden">
+                  <div className="px-4 py-2 bg-surface-muted text-xs font-medium uppercase tracking-wide text-text-secondary">
+                    Changes that will be applied on next deploy
+                  </div>
+                  <table className="w-full text-sm">
+                    <thead className="text-xs text-text-secondary border-b border-border">
+                      <tr>
+                        <th className="text-left px-4 py-2 font-medium">Field</th>
+                        <th className="text-left px-4 py-2 font-medium">From</th>
+                        <th className="text-left px-4 py-2 font-medium">To</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reliability.diff.map((row) => (
+                        <tr key={row.field} className="border-b border-border last:border-0">
+                          <td className="px-4 py-2 font-mono text-xs text-text-primary">{row.field}</td>
+                          <td className="px-4 py-2 text-text-secondary">{row.from}</td>
+                          <td className="px-4 py-2 text-text-primary">{row.to}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Computed values, read-only */}
+                <div className="rounded-lg border border-border overflow-hidden">
+                  <div className="px-4 py-2 bg-surface-muted text-xs font-medium uppercase tracking-wide text-text-secondary">
+                    Computed configuration
+                  </div>
+                  <dl className="divide-y divide-border text-sm">
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">Rolling update</dt>
+                      <dd className="font-mono text-xs text-text-primary">
+                        maxSurge={reliability.derived.rolling_update.max_surge}, maxUnavailable={reliability.derived.rolling_update.max_unavailable}
+                      </dd>
+                    </div>
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">PodDisruptionBudget</dt>
+                      <dd className="font-mono text-xs text-text-primary">
+                        {reliability.derived.pdb ? `minAvailable=${reliability.derived.pdb.min_available}` : 'none'}
+                      </dd>
+                    </div>
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">Pre-stop drain</dt>
+                      <dd className="font-mono text-xs text-text-primary">{reliability.derived.pre_stop?.exec ?? 'none'}</dd>
+                    </div>
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">Termination grace</dt>
+                      <dd className="font-mono text-xs text-text-primary">{reliability.derived.termination_grace_seconds}s</dd>
+                    </div>
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">Topology spread</dt>
+                      <dd className="font-mono text-xs text-text-primary">
+                        {reliability.derived.topology_spread.length === 0
+                          ? 'none'
+                          : reliability.derived.topology_spread
+                              .map((t) => t.key.split('/').pop())
+                              .join(' + ') + ', maxSkew=1'}
+                      </dd>
+                    </div>
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">Image pull policy</dt>
+                      <dd className="font-mono text-xs text-text-primary">{reliability.derived.image_pull_policy}</dd>
+                    </div>
+                    <div className="px-4 py-2 grid grid-cols-2 gap-4">
+                      <dt className="text-text-secondary">Progress deadline</dt>
+                      <dd className="font-mono text-xs text-text-primary">{reliability.derived.progress_deadline_seconds}s</dd>
+                    </div>
+                  </dl>
+                </div>
+
+                {/* Advanced disclosure — overrides */}
+                <details className="rounded-lg border border-border">
+                  <summary className="px-4 py-3 cursor-pointer text-sm font-medium text-text-primary">
+                    Advanced — override derived values
+                  </summary>
+                  <div className="p-4 pt-0 space-y-4">
+                    <p className="text-xs text-text-secondary">
+                      Leave fields blank to use shipit's derived value. Accepts an integer (e.g. <code>1</code>) or percentage (<code>25%</code>).
+                      <br />
+                      <strong>Cannot</strong> set both <code>maxSurge</code> and <code>maxUnavailable</code> to <code>0</code> — the rollout would deadlock.
+                    </p>
+                    <div className="grid grid-cols-2 gap-4">
+                      <Input
+                        label="maxSurge override"
+                        name="max_surge"
+                        defaultValue={reliability.advanced.max_surge ?? ''}
+                        placeholder={reliability.derived.rolling_update.max_surge}
+                        helperText={`Default: ${reliability.derived.rolling_update.max_surge}`}
+                      />
+                      <Input
+                        label="maxUnavailable override"
+                        name="max_unavailable"
+                        defaultValue={reliability.advanced.max_unavailable ?? ''}
+                        placeholder={reliability.derived.rolling_update.max_unavailable}
+                        helperText={`Default: ${reliability.derived.rolling_update.max_unavailable}`}
+                      />
+                    </div>
+                    <Input
+                      label="Longest expected request (seconds)"
+                      type="number"
+                      name="max_request_duration_seconds"
+                      min={5}
+                      max={300}
+                      defaultValue={reliability.advanced.max_request_duration_seconds}
+                      helperText="Drives terminationGracePeriodSeconds. 30s default; bump to 120s for streaming/LLM apps."
+                    />
+                  </div>
+                </details>
+
+                <div className="flex items-center gap-4">
+                  <Button type="submit" disabled={reliabilityMutation.isPending} loading={reliabilityMutation.isPending}>
+                    Save Configuration
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={deployMutation.isPending}
+                    onClick={() => deployMutation.mutate()}
+                    loading={deployMutation.isPending}
+                  >
+                    Redeploy to apply
+                  </Button>
+                  {reliabilityMutation.isSuccess && (
+                    <span className="text-sm text-success">Saved. Redeploy to apply changes.</span>
+                  )}
+                  {reliabilityMutation.isError && (
+                    <span className="text-sm text-danger">{(reliabilityMutation.error as Error).message}</span>
                   )}
                 </div>
               </form>

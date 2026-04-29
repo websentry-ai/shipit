@@ -10,27 +10,31 @@ import (
 // resolved from secrets sync.
 func buildDeployRequestFromApp(app *db.App, baseDomain, secretName string, envVars map[string]string) k8s.DeployRequest {
 	return k8s.DeployRequest{
-		Name:               app.Name,
-		Namespace:          app.Namespace,
-		Image:              app.Image,
-		Replicas:           int32(app.Replicas),
-		Port:               app.Port,
-		EnvVars:            envVars,
-		SecretName:         secretName,
-		CPURequest:         app.CPURequest,
-		CPULimit:           app.CPULimit,
-		MemoryRequest:      app.MemoryRequest,
-		MemoryLimit:        app.MemoryLimit,
-		HealthPath:         app.HealthPath,
-		HealthPort:         app.HealthPort,
-		HealthInitialDelay: app.HealthInitialDelay,
-		HealthPeriod:       app.HealthPeriod,
-		HPAEnabled:         app.HPAEnabled,
-		HPAMinReplicas:     intPtrToInt32Ptr(app.MinReplicas),
-		HPAMaxReplicas:     intPtrToInt32Ptr(app.MaxReplicas),
-		HPATargetCPU:       intPtrToInt32Ptr(app.CPUTarget),
-		HPATargetMemory:    intPtrToInt32Ptr(app.MemoryTarget),
-		BaseDomain:         baseDomain,
+		Name:                      app.Name,
+		Namespace:                 app.Namespace,
+		Image:                     app.Image,
+		Replicas:                  int32(app.Replicas),
+		Port:                      app.Port,
+		EnvVars:                   envVars,
+		SecretName:                secretName,
+		CPURequest:                app.CPURequest,
+		CPULimit:                  app.CPULimit,
+		MemoryRequest:             app.MemoryRequest,
+		MemoryLimit:               app.MemoryLimit,
+		HealthPath:                app.HealthPath,
+		HealthPort:                app.HealthPort,
+		HealthInitialDelay:        app.HealthInitialDelay,
+		HealthPeriod:              app.HealthPeriod,
+		HPAEnabled:                app.HPAEnabled,
+		HPAMinReplicas:            intPtrToInt32Ptr(app.MinReplicas),
+		HPAMaxReplicas:            intPtrToInt32Ptr(app.MaxReplicas),
+		HPATargetCPU:              intPtrToInt32Ptr(app.CPUTarget),
+		HPATargetMemory:           intPtrToInt32Ptr(app.MemoryTarget),
+		BaseDomain:                baseDomain,
+		DisableZeroDowntime:       !app.ZeroDowntimeEnabled,
+		MaxSurgeOverride:          app.MaxSurgeOverride,
+		MaxUnavailableOverride:    app.MaxUnavailableOverride,
+		MaxRequestDurationSeconds: app.MaxRequestDurationSeconds,
 	}
 }
 
@@ -72,5 +76,20 @@ func buildDeployRequestFromRevision(app *db.App, rev *db.AppRevision, baseDomain
 	req.HPAMaxReplicas = intPtrToInt32Ptr(rev.MaxReplicas)
 	req.HPATargetCPU = intPtrToInt32Ptr(rev.CPUTarget)
 	req.HPATargetMemory = intPtrToInt32Ptr(rev.MemoryTarget)
+	// Zero-downtime: revisions written before the migration carry NULLs;
+	// fall back to the app's current setting so rollbacks of pre-migration
+	// revisions still get safe defaults.
+	zdEnabled := app.ZeroDowntimeEnabled
+	if rev.ZeroDowntimeEnabled != nil {
+		zdEnabled = *rev.ZeroDowntimeEnabled
+	}
+	req.DisableZeroDowntime = !zdEnabled
+	req.MaxSurgeOverride = rev.MaxSurgeOverride
+	req.MaxUnavailableOverride = rev.MaxUnavailableOverride
+	if rev.MaxRequestDurationSeconds != nil {
+		req.MaxRequestDurationSeconds = *rev.MaxRequestDurationSeconds
+	} else {
+		req.MaxRequestDurationSeconds = app.MaxRequestDurationSeconds
+	}
 	return req
 }

@@ -269,6 +269,32 @@ func (db *DB) GetAppByDomain(ctx context.Context, domain string) (*App, error) {
 	return &a, err
 }
 
+// UpdateAppReliabilityParams contains zero-downtime mode configuration.
+type UpdateAppReliabilityParams struct {
+	ID                        string
+	ZeroDowntimeEnabled       bool
+	MaxSurgeOverride          *string
+	MaxUnavailableOverride    *string
+	MaxRequestDurationSeconds int
+}
+
+// UpdateAppReliability persists zero-downtime mode + rolling-update overrides.
+// Does not redeploy; reconciliation happens on the next deploy.
+func (db *DB) UpdateAppReliability(ctx context.Context, p UpdateAppReliabilityParams) (*App, error) {
+	var a App
+	err := db.GetContext(ctx, &a, `
+		UPDATE apps SET
+			zero_downtime_enabled = $1,
+			max_surge_override = $2,
+			max_unavailable_override = $3,
+			max_request_duration_seconds = $4,
+			updated_at = NOW()
+		WHERE id = $5 RETURNING *
+	`, p.ZeroDowntimeEnabled, p.MaxSurgeOverride, p.MaxUnavailableOverride,
+		p.MaxRequestDurationSeconds, p.ID)
+	return &a, err
+}
+
 // UpdateAppPreDeployCommand updates the pre-deploy command for an app
 func (db *DB) UpdateAppPreDeployCommand(ctx context.Context, id string, command *string) (*App, error) {
 	var a App
@@ -352,6 +378,11 @@ type CreateRevisionParams struct {
 	Domain *string
 	// Pre-deploy hook
 	PreDeployCommand *string
+	// Zero-downtime snapshot (Phase 2.11)
+	ZeroDowntimeEnabled       *bool
+	MaxSurgeOverride          *string
+	MaxUnavailableOverride    *string
+	MaxRequestDurationSeconds *int
 }
 
 func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppRevision, error) {
@@ -360,13 +391,15 @@ func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppR
 		INSERT INTO app_revisions (app_id, revision_number, image, replicas, port, env_vars,
 			cpu_request, cpu_limit, memory_request, memory_limit,
 			health_path, health_port, health_initial_delay, health_period,
-			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain, pre_deploy_command)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain, pre_deploy_command,
+			zero_downtime_enabled, max_surge_override, max_unavailable_override, max_request_duration_seconds)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 		RETURNING *
 	`, p.AppID, p.RevisionNumber, p.Image, p.Replicas, p.Port, p.EnvVars,
 		p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit,
 		p.HealthPath, p.HealthPort, p.HealthDelay, p.HealthPeriod,
-		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain, p.PreDeployCommand)
+		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain, p.PreDeployCommand,
+		p.ZeroDowntimeEnabled, p.MaxSurgeOverride, p.MaxUnavailableOverride, p.MaxRequestDurationSeconds)
 	return &r, err
 }
 

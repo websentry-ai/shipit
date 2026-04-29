@@ -174,6 +174,54 @@ export interface DomainConfig {
   domain?: string;
 }
 
+// Reliability ("zero-downtime mode") — Phase 2.11.
+// Single toggle on the dashboard with an Advanced disclosure for rolling-
+// update budget overrides. Server returns derived values + diff so the UI
+// can preview exactly what the renderer will apply on next deploy.
+export interface ReliabilityConfig {
+  enabled: boolean;
+  max_surge?: string | null;        // "1" | "25%" | null = derived
+  max_unavailable?: string | null;
+  max_request_duration_seconds: number;
+}
+
+export interface ReliabilityDerived {
+  rolling_update: { max_surge: string; max_unavailable: string };
+  pdb?: { min_available: number };
+  termination_grace_seconds: number;
+  pre_stop?: { exec: string };
+  topology_spread: { key: string; max_skew: number }[];
+  progress_deadline_seconds: number;
+  image_pull_policy: string;
+  readiness_probe_configured: boolean;
+}
+
+export interface ReliabilityPreconditions {
+  replicas_ok: boolean;
+  min_replicas_required: number;
+  health_path_set: boolean;
+  image_tag_immutable: boolean;
+  blockers: string[];
+}
+
+export interface ReliabilityDiffRow {
+  field: string;
+  from: string;
+  to: string;
+}
+
+export interface ReliabilityResponse {
+  enabled: boolean;
+  advanced: {
+    max_surge: string | null;
+    max_unavailable: string | null;
+    max_request_duration_seconds: number;
+  };
+  derived: ReliabilityDerived;
+  preconditions: ReliabilityPreconditions;
+  diff: ReliabilityDiffRow[];
+}
+
 export interface PreDeployHookStatus {
   pre_deploy_command?: string;
 }
