@@ -420,6 +420,11 @@ func MonitoringNamespace() string { return monitoringNamespace }
 // "<release>-grafana" or "prometheus-<release>-prometheus".
 func MonitoringHelmReleaseName() string { return helmReleaseName }
 
+// MonitoringChartVersion returns the pinned chart version stamped into the
+// cluster row at install time. Bumping the constant + redeploying shipit is
+// the upgrade path.
+func MonitoringChartVersion() string { return helmChartVersion }
+
 // promServiceURL returns the cluster-internal URL used by the apiserver
 // service proxy to reach Prometheus' HTTP API. Kept here so the constant
 // for the prometheus-operated service name lives next to the install.

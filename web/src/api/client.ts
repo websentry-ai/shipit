@@ -18,6 +18,9 @@ import type {
   CreateTokenRequest,
   CreateTokenResponse,
   IngressControllerInfo,
+  MonitoringResponse,
+  MonitoringConfig,
+  MetricsResponse,
 } from '../types';
 
 const API_BASE = '/api';
@@ -295,6 +298,42 @@ export async function createToken(data: CreateTokenRequest): Promise<CreateToken
 
 export async function deleteToken(tokenId: string): Promise<void> {
   return request(`/tokens/${tokenId}`, { method: 'DELETE' });
+}
+
+// Cluster monitoring add-on (kube-prometheus-stack)
+export async function getMonitoring(clusterId: string): Promise<MonitoringResponse> {
+  return request<MonitoringResponse>(`/clusters/${clusterId}/monitoring`);
+}
+
+export async function enableMonitoring(
+  clusterId: string,
+  config?: MonitoringConfig
+): Promise<MonitoringResponse> {
+  return request<MonitoringResponse>(`/clusters/${clusterId}/monitoring`, {
+    method: 'POST',
+    body: JSON.stringify(config ?? {}),
+  });
+}
+
+export async function disableMonitoring(clusterId: string): Promise<void> {
+  return request(`/clusters/${clusterId}/monitoring`, { method: 'DELETE' });
+}
+
+// Per-app metrics (PromQL via cluster's monitoring add-on)
+export async function getAppMetrics(
+  appId: string,
+  metric: 'cpu' | 'memory' | 'network_in' | 'network_out' | 'restarts',
+  fromUnix: number,
+  toUnix: number,
+  stepSeconds?: number
+): Promise<MetricsResponse> {
+  const q = new URLSearchParams({
+    metric,
+    from: String(fromUnix),
+    to: String(toUnix),
+  });
+  if (stepSeconds) q.set('step', String(stepSeconds));
+  return request<MetricsResponse>(`/apps/${appId}/metrics?${q.toString()}`);
 }
 
 // Porter migration - switch app management

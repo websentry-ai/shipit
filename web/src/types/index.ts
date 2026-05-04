@@ -12,6 +12,45 @@ export interface Cluster {
   status: string;
   status_message?: string;
   created_at: string;
+
+  // Monitoring add-on (kube-prometheus-stack via Helm).
+  monitoring_status?: 'disabled' | 'installing' | 'ready' | 'failed' | 'uninstalling';
+  monitoring_status_message?: string;
+  monitoring_grafana_host?: string;
+  monitoring_helm_release?: string;
+  monitoring_chart_version?: string;
+  monitoring_installed_at?: string;
+  monitoring_updated_at?: string;
+}
+
+// Cluster-level monitoring add-on response from GET /clusters/:id/monitoring.
+export interface MonitoringResponse {
+  status: 'disabled' | 'installing' | 'ready' | 'failed' | 'uninstalling';
+  status_message?: string;
+  grafana_host?: string;
+  grafana_url?: string;
+  helm_release?: string;
+  chart_version?: string;
+  installed_at?: string;
+}
+
+export interface MonitoringConfig {
+  grafana_host?: string;
+}
+
+// Per-app metrics query (PromQL via the cluster's monitoring add-on).
+export interface MetricsResponse {
+  metric: string;
+  step_seconds: number;
+  from: number;
+  to: number;
+  series: MetricSeries[];
+}
+
+export interface MetricSeries {
+  labels: Record<string, string>;
+  timestamps: number[]; // unix seconds
+  values: number[];
 }
 
 export interface App {

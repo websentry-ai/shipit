@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getCluster, listApps, createApp, deleteApp, deployApp } from '../api/client';
+import { getCluster, listApps, createApp, deleteApp, deployApp, getMonitoring, enableMonitoring, disableMonitoring } from '../api/client';
 import type { App, CreateAppRequest } from '../types';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
@@ -95,6 +95,28 @@ export default function Apps() {
     queryKey: ['apps', clusterId],
     queryFn: () => listApps(clusterId!),
     enabled: !!clusterId,
+  });
+
+  // Monitoring add-on state. Polls while installing so the UI flips on its
+  // own without a manual refresh — install takes 2-5 min for first-time
+  // PVC + cert provisioning.
+  const { data: monitoring } = useQuery({
+    queryKey: ['monitoring', clusterId],
+    queryFn: () => getMonitoring(clusterId!),
+    enabled: !!clusterId,
+    refetchInterval: (q) => {
+      const s = q.state.data?.status;
+      return s === 'installing' || s === 'uninstalling' ? 5000 : false;
+    },
+  });
+
+  const enableMonitoringMutation = useMutation({
+    mutationFn: () => enableMonitoring(clusterId!),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['monitoring', clusterId] }),
+  });
+  const disableMonitoringMutation = useMutation({
+    mutationFn: () => disableMonitoring(clusterId!),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['monitoring', clusterId] }),
   });
 
   const createMutation = useMutation({
@@ -209,6 +231,75 @@ export default function Apps() {
           New App
         </Button>
       </div>
+
+      {/* Monitoring add-on (cluster-level: kube-prometheus-stack + Grafana) */}
+      <Card className="mb-6">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="text-lg font-medium text-text-primary">Monitoring</h3>
+              {monitoring && monitoring.status !== 'disabled' && (
+                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                  monitoring.status === 'ready' ? 'bg-success-muted text-success' :
+                  monitoring.status === 'failed' ? 'bg-error-muted text-error' :
+                  'bg-info-muted text-info'
+                }`}>
+                  {monitoring.status}
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-sm text-text-secondary">
+              Installs Prometheus + Grafana into the cluster's <code>monitoring</code> namespace. Per-app graphs (1h–30d) appear under each app's Monitoring tab once ready.
+            </p>
+            {monitoring?.status === 'failed' && monitoring.status_message && (
+              <p className="mt-2 text-sm text-error">Error: {monitoring.status_message}</p>
+            )}
+            {monitoring?.installed_at && (
+              <p className="mt-1 text-xs text-text-muted">
+                Installed {new Date(monitoring.installed_at).toLocaleString()}
+                {monitoring.chart_version && ` · chart ${monitoring.chart_version}`}
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {monitoring?.status === 'ready' && monitoring.grafana_url && (
+              <a
+                href={monitoring.grafana_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm px-3 py-1.5 rounded-md border border-border text-text-primary hover:bg-surface-hover transition-colors"
+              >
+                Open Grafana →
+              </a>
+            )}
+            {(!monitoring || monitoring.status === 'disabled' || monitoring.status === 'failed') && (
+              <Button
+                onClick={() => enableMonitoringMutation.mutate()}
+                disabled={enableMonitoringMutation.isPending}
+                loading={enableMonitoringMutation.isPending}
+              >
+                {monitoring?.status === 'failed' ? 'Retry install' : 'Enable Monitoring'}
+              </Button>
+            )}
+            {monitoring?.status === 'installing' && (
+              <span className="text-sm text-text-secondary">Installing… (2–5 min)</span>
+            )}
+            {(monitoring?.status === 'ready' || monitoring?.status === 'installing') && (
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  if (confirm('Uninstall monitoring? Helm release will be removed; PVCs (Prometheus TSDB, Grafana SQLite) are preserved.')) {
+                    disableMonitoringMutation.mutate();
+                  }
+                }}
+                disabled={disableMonitoringMutation.isPending}
+              >
+                Disable
+              </Button>
+            )}
+          </div>
+        </div>
+      </Card>
 
       {/* Create App Modal */}
       <Modal
