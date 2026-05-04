@@ -24,6 +24,14 @@ type Config struct {
 
 	// Default app URL configuration
 	AppBaseDomain string // e.g., "apps.shipit.unboundsec.dev" - apps get URLs like <name>.apps.shipit.unboundsec.dev
+
+	// Monitoring add-on (kube-prometheus-stack Helm release). Shared across
+	// all clusters shipit manages — one OAuth client, all clusters' Grafanas
+	// reuse it via per-cluster redirect URIs of the form
+	// https://grafana.<cluster-base-domain>/login/google
+	GrafanaGoogleClientID      string
+	GrafanaGoogleClientSecret  string
+	GrafanaGoogleAllowedDomain string // e.g., "unboundsecurity.ai"
 }
 
 func Load() *Config {
@@ -46,6 +54,11 @@ func Load() *Config {
 
 		// App URLs
 		AppBaseDomain: getEnv("APP_BASE_DOMAIN", ""), // e.g., "apps.shipit.unboundsec.dev"
+
+		// Monitoring (Grafana SSO)
+		GrafanaGoogleClientID:      getEnv("GRAFANA_GOOGLE_CLIENT_ID", ""),
+		GrafanaGoogleClientSecret:  getEnv("GRAFANA_GOOGLE_CLIENT_SECRET", ""),
+		GrafanaGoogleAllowedDomain: getEnv("GRAFANA_GOOGLE_ALLOWED_DOMAIN", ""),
 	}
 }
 

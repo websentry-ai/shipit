@@ -27,6 +27,12 @@ type Handler struct {
 	appBaseDomain   string // e.g., "apps.shipit.unboundsec.dev"
 	porterDiscovery *porter.DiscoveryService
 
+	// Monitoring add-on: Grafana SSO is shipit-global, sourced from env at
+	// boot. Empty values cause InstallMonitoring to fail with a clear error.
+	grafanaGoogleClientID      string
+	grafanaGoogleClientSecret  string
+	grafanaGoogleAllowedDomain string
+
 	// deployLocks serializes concurrent deploys of the same app. Two overlapping
 	// deployApp goroutines would race on the Deployment spec (replicas, image)
 	// and on the HPA (reconciled on every deploy now). sync.Map lets us allocate
@@ -44,6 +50,15 @@ func NewHandler(database *db.DB, encryptKey, appBaseDomain string, porterDiscove
 		appBaseDomain:   appBaseDomain,
 		porterDiscovery: porterDiscovery,
 	}
+}
+
+// SetMonitoringConfig wires the shipit-global Grafana OAuth credentials into
+// the handler. Called once at boot from NewRouter; kept as a setter so
+// NewHandler doesn't grow another arg list.
+func (h *Handler) SetMonitoringConfig(clientID, clientSecret, allowedDomain string) {
+	h.grafanaGoogleClientID = clientID
+	h.grafanaGoogleClientSecret = clientSecret
+	h.grafanaGoogleAllowedDomain = allowedDomain
 }
 
 // lockAppDeploy returns an unlock function that must be called when the

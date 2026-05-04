@@ -22,6 +22,7 @@ import {
   setPreDeployHook,
   getClusterIngress,
   switchAppManagement,
+  getMonitoring,
 } from '../api/client';
 import type { AppRevision, AppSecret, UpdateAppRequest, HPAConfig, DomainConfig, PreDeployHookConfig } from '../types';
 import { Button } from '../components/ui/Button';
@@ -30,6 +31,7 @@ import { StatusBadge } from '../components/ui/Badge';
 import { Modal, ConfirmModal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
 import { Skeleton } from '../components/ui/Skeleton';
+import { MetricsChart } from '../components/MetricsChart';
 
 function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
@@ -58,6 +60,18 @@ export default function AppDetail() {
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [rollbackConfirm, setRollbackConfirm] = useState<AppRevision | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  // Monitoring tab range picker. "now" is captured at render time per
+  // selection so the URL is stable while the user looks at a chart, then
+  // re-anchors when they pick a new range or click Refresh.
+  type RangeKey = '1h' | '6h' | '1d' | '3d' | '7d' | '30d';
+  const rangeSeconds: Record<RangeKey, number> = {
+    '1h': 3600, '6h': 6 * 3600, '1d': 86400, '3d': 3 * 86400, '7d': 7 * 86400, '30d': 30 * 86400,
+  };
+  const [metricsRange, setMetricsRange] = useState<RangeKey>('1h');
+  const [metricsAnchor, setMetricsAnchor] = useState<number>(() => Math.floor(Date.now() / 1000));
+  const fromUnix = metricsAnchor - rangeSeconds[metricsRange];
+  const toUnix = metricsAnchor;
   const eventSourceRef = useRef<EventSource | null>(null);
 
   // Environment variable editing state
@@ -121,6 +135,16 @@ export default function AppDetail() {
     queryKey: ['cluster-ingress', app?.cluster_id],
     queryFn: () => getClusterIngress(app!.cluster_id),
     enabled: !!app?.cluster_id && activeTab === 'domain',
+  });
+
+  // Cluster-level monitoring readiness — drives whether the historical
+  // charts render or the empty-state CTA does. Polls while installing
+  // because cluster-side install is async.
+  const { data: clusterMonitoring } = useQuery({
+    queryKey: ['monitoring', app?.cluster_id],
+    queryFn: () => getMonitoring(app!.cluster_id),
+    enabled: !!app?.cluster_id && activeTab === 'monitoring',
+    refetchInterval: (q) => (q.state.data?.status === 'installing' ? 5000 : false),
   });
 
   const deployMutation = useMutation({
@@ -579,6 +603,101 @@ export default function AppDetail() {
 
       {activeTab === 'monitoring' && (
         <div className="space-y-6">
+          {/* Historical Graphs (Prometheus add-on) */}
+          <Card padding="none">
+            <div className="p-4 border-b border-border flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-medium text-text-primary">Historical Graphs</h3>
+                <p className="mt-1 text-sm text-text-secondary">
+                  CPU, memory, and network usage from in-cluster Prometheus.
+                </p>
+              </div>
+              {clusterMonitoring?.status === 'ready' && (
+                <div className="flex items-center gap-2">
+                  {(['1h', '6h', '1d', '3d', '7d', '30d'] as const).map((r) => (
+                    <button
+                      key={r}
+                      onClick={() => {
+                        setMetricsRange(r);
+                        setMetricsAnchor(Math.floor(Date.now() / 1000));
+                      }}
+                      className={`text-xs px-2 py-1 rounded-md border transition-colors ${
+                        metricsRange === r
+                          ? 'bg-accent text-white border-accent'
+                          : 'border-border text-text-secondary hover:text-text-primary hover:bg-surface-hover'
+                      }`}
+                    >
+                      {r}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setMetricsAnchor(Math.floor(Date.now() / 1000))}
+                    className="text-xs px-2 py-1 rounded-md border border-border text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+                    title="Refresh — re-anchor to now"
+                  >
+                    ↻
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="p-6">
+              {!clusterMonitoring || clusterMonitoring.status === 'disabled' ? (
+                <div className="text-center py-8">
+                  <p className="text-text-secondary mb-4">
+                    Monitoring isn't enabled on this cluster yet.
+                  </p>
+                  <Link
+                    to={`/clusters/${app?.cluster_id}/apps`}
+                    className="inline-block text-sm px-3 py-1.5 rounded-md bg-accent text-white hover:bg-accent-hover transition-colors"
+                  >
+                    Go to cluster → Enable Monitoring
+                  </Link>
+                </div>
+              ) : clusterMonitoring.status === 'installing' ? (
+                <div className="text-center py-8 text-text-secondary">
+                  Installing monitoring add-on… (2–5 min for first-time install). Charts will appear once Prometheus is ready.
+                </div>
+              ) : clusterMonitoring.status === 'failed' ? (
+                <div className="text-center py-8">
+                  <p className="text-error text-sm">
+                    Monitoring install failed: {clusterMonitoring.status_message}
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <MetricsChart
+                    appId={appId!}
+                    metric="cpu"
+                    title="CPU usage"
+                    fromUnix={fromUnix}
+                    toUnix={toUnix}
+                  />
+                  <MetricsChart
+                    appId={appId!}
+                    metric="memory"
+                    title="Memory (working set)"
+                    fromUnix={fromUnix}
+                    toUnix={toUnix}
+                  />
+                  <MetricsChart
+                    appId={appId!}
+                    metric="network_in"
+                    title="Network in"
+                    fromUnix={fromUnix}
+                    toUnix={toUnix}
+                  />
+                  <MetricsChart
+                    appId={appId!}
+                    metric="network_out"
+                    title="Network out"
+                    fromUnix={fromUnix}
+                    toUnix={toUnix}
+                  />
+                </div>
+              )}
+            </div>
+          </Card>
+
           {/* Pod Metrics */}
           <Card padding="none">
             <div className="p-4 border-b border-border">

@@ -16,6 +16,7 @@ import (
 func NewRouter(database *db.DB, cfg *config.Config, porterDiscovery *porter.DiscoveryService) http.Handler {
 	r := chi.NewRouter()
 	h := NewHandler(database, cfg.EncryptKey, cfg.AppBaseDomain, porterDiscovery)
+	h.SetMonitoringConfig(cfg.GrafanaGoogleClientID, cfg.GrafanaGoogleClientSecret, cfg.GrafanaGoogleAllowedDomain)
 	oauth := auth.NewOAuthHandler(cfg, database)
 
 	// Global middleware
@@ -64,6 +65,13 @@ func NewRouter(database *db.DB, cfg *config.Config, porterDiscovery *porter.Disc
 				r.Get("/", h.ListApps)
 				r.Post("/", h.CreateApp)
 			})
+
+			// Monitoring add-on (kube-prometheus-stack via Helm)
+			r.Route("/monitoring", func(r chi.Router) {
+				r.Get("/", h.GetMonitoring)
+				r.Post("/", h.EnableMonitoring)
+				r.Delete("/", h.DisableMonitoring)
+			})
 		})
 
 		// Apps (direct access)
@@ -104,6 +112,9 @@ func NewRouter(database *db.DB, cfg *config.Config, porterDiscovery *porter.Disc
 			// Pre-deploy hooks
 			r.Get("/predeploy", h.GetPreDeployHook)
 			r.Put("/predeploy", h.SetPreDeployHook)
+
+			// Per-app metrics (PromQL via cluster monitoring add-on)
+			r.Get("/metrics", h.GetAppMetrics)
 
 			// Exec - run commands in containers
 			r.Post("/exec", h.ExecCommand)
