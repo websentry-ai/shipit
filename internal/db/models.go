@@ -79,6 +79,12 @@ type App struct {
 	ManagedBy    string  `db:"managed_by" json:"managed_by"`                     // "shipit", "porter", or "observer"
 	PorterAppID  *string `db:"porter_app_id" json:"porter_app_id,omitempty"`     // Porter's internal app ID
 	PorterAppURL *string `db:"porter_app_url" json:"porter_app_url,omitempty"`   // Porter dashboard URL
+
+	// CI/CD tracking (Phase 5)
+	LastDeployedSHA *string `db:"last_deployed_sha" json:"last_deployed_sha,omitempty"`
+	RepoURL         *string `db:"repo_url" json:"repo_url,omitempty"`
+	TrackedBranch   *string `db:"tracked_branch" json:"tracked_branch,omitempty"`
+	DeployOnPush    bool    `db:"deploy_on_push" json:"deploy_on_push"`
 }
 
 // AppRevision stores a snapshot of app configuration at deploy time
@@ -123,6 +129,9 @@ type AppRevision struct {
 	DeployStatus  string     `db:"deploy_status" json:"deploy_status"`
 	DeployMessage *string    `db:"deploy_message" json:"deploy_message,omitempty"`
 	DeployedAt    *time.Time `db:"deployed_at" json:"deployed_at,omitempty"`
+
+	// CI/CD: commit SHA that produced the image for this revision
+	DeployedSHA *string `db:"deployed_sha" json:"deployed_sha,omitempty"`
 }
 
 type AppSecret struct {

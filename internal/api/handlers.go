@@ -466,6 +466,14 @@ func (h *Handler) UpdateApp(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(app)
 }
 
+// deployTriggerRequest is the optional JSON body for POST /apps/:id/deploy.
+// CI systems pass image+sha to pin the exact digest; the UI omits the body to
+// redeploy the image already stored in the DB.
+type deployTriggerRequest struct {
+	Image string `json:"image"` // full image ref including :<sha> tag
+	SHA   string `json:"sha"`   // 40-char commit SHA for idempotency tracking
+}
+
 func (h *Handler) DeployApp(w http.ResponseWriter, r *http.Request) {
 	appID := chi.URLParam(r, "appID")
 
@@ -473,6 +481,33 @@ func (h *Handler) DeployApp(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpError(w, "app not found", http.StatusNotFound)
 		return
+	}
+
+	// Parse optional CI trigger body.
+	var trigger deployTriggerRequest
+	if r.ContentLength > 0 {
+		json.NewDecoder(r.Body).Decode(&trigger)
+	}
+
+	// Idempotency: if CI is re-sending the same SHA (e.g. retry), skip the
+	// deploy entirely rather than cycling the cluster for no reason.
+	if trigger.SHA != "" && app.LastDeployedSHA != nil && *app.LastDeployedSHA == trigger.SHA {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "already_deployed", "sha": trigger.SHA})
+		return
+	}
+
+	// If CI passed an explicit image, update the DB before launching the
+	// goroutine so the re-fetch inside deployApp() picks up the new value.
+	if trigger.Image != "" {
+		sha := trigger.SHA
+		if sha == "" {
+			sha = trigger.Image // fall back to full image ref as tracking key
+		}
+		if err := h.db.UpdateAppImageAndSHA(r.Context(), appID, trigger.Image, sha); err != nil {
+			httpError(w, "failed to update app image", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	cluster, err := h.db.GetCluster(r.Context(), app.ClusterID)
@@ -491,13 +526,14 @@ func (h *Handler) DeployApp(w http.ResponseWriter, r *http.Request) {
 	// Update status to deploying
 	h.db.UpdateAppStatus(r.Context(), appID, "deploying", nil)
 
-	// Deploy in background
-	go h.deployApp(appID, app, kubeconfig)
+	// Deploy in background, carrying the SHA so it can be recorded on success.
+	go h.deployApp(appID, app, kubeconfig, trigger.SHA)
 
+	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"status": "deploying"})
 }
 
-func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
+func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte, sha string) {
 	// Serialize concurrent deploys on the same app. Without this, two goroutines
 	// would race on Deployment spec (replicas, image) and on the HPA (reconciled
 	// on every deploy). Lock is acquired BEFORE the DB re-fetch so the second
@@ -536,6 +572,12 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	cpuLim := app.CPULimit
 	memReq := app.MemoryRequest
 	memLim := app.MemoryLimit
+	var deployedSHA *string
+	if sha != "" {
+		deployedSHA = &sha
+	} else if app.LastDeployedSHA != nil {
+		deployedSHA = app.LastDeployedSHA
+	}
 	_, err = h.db.CreateRevision(ctx, db.CreateRevisionParams{
 		AppID:          appID,
 		RevisionNumber: newRevision,
@@ -561,6 +603,8 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 		Domain: app.Domain,
 		// Pre-deploy hook snapshot
 		PreDeployCommand: app.PreDeployCommand,
+		// CI/CD
+		DeployedSHA: deployedSHA,
 	})
 	if err != nil {
 		msg := "failed to create revision: " + err.Error()
@@ -634,6 +678,10 @@ func (h *Handler) deployApp(appID string, app *db.App, kubeconfig []byte) {
 	h.db.UpdateAppStatus(ctx, appID, "running", nil)
 	// Mark revision as successful
 	h.db.UpdateRevisionStatus(ctx, appID, newRevision, "success", nil)
+	// Persist the deployed SHA so future identical triggers are idempotent
+	if sha != "" {
+		h.db.UpdateAppLastDeployedSHA(ctx, appID, sha)
+	}
 
 	h.syncCustomDomainIngress(ctx, appID, app, client, app.Port)
 
@@ -1059,7 +1107,7 @@ func (h *Handler) RollbackApp(w http.ResponseWriter, r *http.Request) {
 		log.Printf("rollback: app re-fetch failed — falling back to pre-update snapshot app=%s err=%v", appID, err)
 		updatedApp = app
 	}
-	go h.deployApp(appID, updatedApp, kubeconfig)
+	go h.deployApp(appID, updatedApp, kubeconfig, "")
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":            "rolling_back",

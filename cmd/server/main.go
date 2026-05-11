@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/vigneshsubbiah/shipit/internal/api"
 	"github.com/vigneshsubbiah/shipit/internal/auth"
 	"github.com/vigneshsubbiah/shipit/internal/config"
@@ -18,6 +19,10 @@ import (
 )
 
 func main() {
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: could not load .env: %v", err)
+	}
+
 	cfg := config.Load()
 
 	// Validate encryption key

@@ -21,3 +21,8 @@ internal/web/dist/
 
 # Build artifacts
 dist/
+
+# development docs
+infra/AWS_SETUP.md
+infra/CICD_PLAN.md
+CODEBASE.md

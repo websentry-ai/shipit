@@ -1,0 +1,53 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # allow manual trigger from GitHub UI
+
+permissions:
+  id-token: write  # required for OIDC → AWS
+  contents: read
+
+jobs:
+  deploy:
+    name: Build, push, deploy
+    runs-on: ubuntu-latest
+
+    steps:    
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::228304386839:role/github-actions-shipit-deploy
+          aws-region: us-west-2
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          SHA: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/$REPOSITORY:$SHA"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger ShipIt deploy
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+          SHA: ${{ github.sha }}
+          SHIPIT_APP_ID: ${{ vars.SHIPIT_APP_ID }}
+          SHIPIT_TOKEN: ${{ secrets.SHIPIT_TOKEN }}
+        run: |
+          curl -fsS \
+            -X POST "https://shipit.unboundsec.dev/api/apps/$SHIPIT_APP_ID/deploy" \
+            -H "Authorization: Bearer $SHIPIT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"image\": \"$IMAGE\", \"sha\": \"$SHA\"}"

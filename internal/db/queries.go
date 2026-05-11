@@ -279,6 +279,24 @@ func (db *DB) UpdateAppPreDeployCommand(ctx context.Context, id string, command 
 	return &a, err
 }
 
+// UpdateAppImageAndSHA atomically updates the image and records the commit SHA
+// that produced it. Called by the deploy handler when CI passes an explicit image override.
+func (db *DB) UpdateAppImageAndSHA(ctx context.Context, id, image, sha string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE apps SET image = $1, last_deployed_sha = $2, updated_at = NOW()
+		WHERE id = $3
+	`, image, sha, id)
+	return err
+}
+
+// UpdateAppLastDeployedSHA records the SHA after a successful rollout completes.
+func (db *DB) UpdateAppLastDeployedSHA(ctx context.Context, id, sha string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE apps SET last_deployed_sha = $1, updated_at = NOW() WHERE id = $2
+	`, sha, id)
+	return err
+}
+
 // Secret operations
 
 func (db *DB) ListSecrets(ctx context.Context, appID string) ([]AppSecret, error) {
@@ -352,6 +370,8 @@ type CreateRevisionParams struct {
 	Domain *string
 	// Pre-deploy hook
 	PreDeployCommand *string
+	// CI/CD
+	DeployedSHA *string
 }
 
 func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppRevision, error) {
@@ -360,13 +380,15 @@ func (db *DB) CreateRevision(ctx context.Context, p CreateRevisionParams) (*AppR
 		INSERT INTO app_revisions (app_id, revision_number, image, replicas, port, env_vars,
 			cpu_request, cpu_limit, memory_request, memory_limit,
 			health_path, health_port, health_initial_delay, health_period,
-			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain, pre_deploy_command)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+			hpa_enabled, min_replicas, max_replicas, cpu_target, memory_target, domain, pre_deploy_command,
+			deployed_sha)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		RETURNING *
 	`, p.AppID, p.RevisionNumber, p.Image, p.Replicas, p.Port, p.EnvVars,
 		p.CPURequest, p.CPULimit, p.MemRequest, p.MemLimit,
 		p.HealthPath, p.HealthPort, p.HealthDelay, p.HealthPeriod,
-		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain, p.PreDeployCommand)
+		p.HPAEnabled, p.MinReplicas, p.MaxReplicas, p.CPUTarget, p.MemoryTarget, p.Domain, p.PreDeployCommand,
+		p.DeployedSHA)
 	return &r, err
 }
 
